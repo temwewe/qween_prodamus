@@ -45,9 +45,12 @@ def send_prodamus_message(chat_channel_id, student_id, text):
         "studentId": student_id,
         "text": text
     }
+    print(f"DEBUG: Sending to Prodamus: URL={PRODAMUS_BASE_URL}/chat-channel/messages, Payload={payload}, Headers={HEADERS_PRODAMUS}")
     try:
         # POST /api/v1/chat-channel/messages
         response = requests.post(f"{PRODAMUS_BASE_URL}/chat-channel/messages", headers=HEADERS_PRODAMUS, json=payload)
+        if response.status_code != 200:
+            print(f"DEBUG: Prodamus error response: {response.text}")
         response.raise_for_status()
         return True
     except Exception as e:
@@ -56,44 +59,42 @@ def send_prodamus_message(chat_channel_id, student_id, text):
 
 @app.route('/', methods=['POST'])
 def webhook():
-    # Log raw data to debug the 400 error
-    raw_data = request.get_data(as_text=True)
-    print(f"DEBUG: Raw request data: {raw_data}")
-    print(f"DEBUG: Content-Type: {request.content_type}")
+    # Log detailed request info
+    content_length = request.content_length
+    content_type = request.content_type
+    print(f"DEBUG: POST received. Content-Length: {content_length}, Content-Type: {content_type}")
 
-    # Try to parse JSON first
-    data = request.get_json(silent=True)
+    if content_length == 0:
+        return jsonify({"status": "error", "message": "Empty request body"}), 400
+
+    data = request.get_json()
+    print(f"DEBUG: Received JSON payload: {data}")
     
-    # If not JSON, try parsing as form data
-    if data is None:
-        data = request.form.to_dict()
-        print(f"DEBUG: Parsed as form data: {data}")
-    else:
-        print(f"DEBUG: Parsed as JSON: {data}")
-
     if not data:
-        return jsonify({"status": "error", "message": "Could not parse request body"}), 400
+        # If get_json failed, it might be because the Content-Type is not application/json
+        # or the body is not valid JSON.
+        raw_data = request.get_data(as_text=True)
+        print(f"DEBUG: Raw data that failed to parse: {raw_data}")
+        return jsonify({"status": "error", "message": "Failed to parse JSON"}), 400
     
-    # Prodamus webhooks often have data nested or use specific field names.
-    # We look for key fields in either the top level or nested
-    message_text = data.get("text") or data.get("message", {}).get("text")
+    # Based on the Prodamus API docs for 'POST /api/v1/chat-channel/messages'
+    # we need chatChannelId, studentId, and text. 
     chat_channel_id = data.get("chatChannelId")
-    student_id = data.get("studentId") or data.get("contact", {}).get("id")
+    student_id = data.get("studentId")
+    message_text = data.get("text")
     
     print(f"DEBUG: Parsed - chat_channel_id: {chat_channel_id}, student_id: {student_id}, text: {message_text}")
     
-    if not message_text:
-        return jsonify({"status": "error", "message": "Missing message text"}), 400
+    if not chat_channel_id or not student_id or not message_text:
+        return jsonify({"status": "error", "message": "Missing required fields: chatChannelId, studentId, text"}), 400
     
     # 2. Получаем ответ от Qwen
     ai_response = call_qwen_api(message_text)
     
-    # 3. Отправляем ответ в Продамус (только если есть куда отправлять)
-    if chat_channel_id and student_id:
-        success = send_prodamus_message(chat_channel_id, student_id, ai_response)
-        if success:
-            return jsonify({"status": "success"}), 200
-        else:
-            return jsonify({"status": "error", "message": "Failed to send response"}), 500
+    # 3. Отправляем ответ в Продамус
+    success = send_prodamus_message(chat_channel_id, student_id, ai_response)
     
-    return jsonify({"status": "success", "message": "Processed but no reply sent (missing IDs)"}), 200
+    if success:
+        return jsonify({"status": "success"}), 200
+    else:
+        return jsonify({"status": "error", "message": "Failed to send response to Prodamus"}), 500
