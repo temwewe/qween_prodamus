@@ -42,50 +42,50 @@ def call_qwen_api(message_text):
 
 
 def get_conversation_id(student_id):
-    """Получаем conversationId через API Prodamus"""
-    
+    """Получаем conversationId через API Prodamus.
+
+    ВАЖНО: ответ этого эндпоинта - это ОДИН объект последнего сообщения,
+    а не список и не {success, body}. conversationId лежит прямо на
+    верхнем уровне ответа. См. пример ответа в документации:
+
+    {
+      "id": null,
+      "conversationId": null,
+      "text": null,
+      "fromChatUserId": null,
+      "user": {...},
+      "createdDate": "...",
+      "updatedDate": null
+    }
+    """
+
     url = f"{PRODAMUS_BASE_URL}/chat-channel/messages/recent"
     params = {
         "chatChannelId": int(CHAT_CHANNEL_ID),
         "studentId": student_id,
         "take": 5
     }
-    
+
     headers = {
         "Authorization": f"Bearer {PRODAMUS_API_KEY}",
         "Content-Type": "application/json"
     }
-    
+
     try:
         response = requests.get(url, headers=headers, params=params, timeout=10)
         print(f"DEBUG: Get recent messages status={response.status_code}")
-        
+        print(f"DEBUG: Get recent messages body: {response.text[:500]}")
+
         if response.status_code == 200:
             data = response.json()
-            
-            # Проверяем что ответ успешный
-            if isinstance(data, dict) and data.get("success"):
-                messages = data.get("value", []) or data.get("data", [])
-                
-                if messages:
-                    # Берём последнее сообщение от этого студента
-                    for msg in reversed(messages):
-                        if isinstance(msg, dict):
-                            sender = msg.get("senderId") or msg.get("SenderId") or msg.get("contactId")
-                            conv_id = msg.get("conversationId") or msg.get("ConversationId")
-                            
-                            if sender == student_id and conv_id:
-                                print(f"DEBUG: Found conversationId={conv_id}")
-                                return conv_id
-                    
-                    # Если не нашли от этого студента — берём любой conversationId
-                    last_msg = messages[-1] if isinstance(messages, list) else messages
-                    if isinstance(last_msg, dict):
-                        conv_id = last_msg.get("conversationId") or last_msg.get("ConversationId")
-                        if conv_id:
-                            print(f"DEBUG: Using last conversationId={conv_id}")
-                            return conv_id
-        
+
+            # conversationId лежит на верхнем уровне ответа
+            conv_id = data.get("conversationId") or data.get("ConversationId")
+
+            if conv_id:
+                print(f"DEBUG: Found conversationId={conv_id}")
+                return conv_id
+
         print("DEBUG: No conversation found via API")
         return None
     except Exception as e:
@@ -95,18 +95,18 @@ def get_conversation_id(student_id):
 
 def send_prodamus_message(student_id, text, conversation_id=None):
     """Отправляем сообщение в Prodamus"""
-    
+
     payload = {
         "ChatChannelId": int(CHAT_CHANNEL_ID),
         "StudentId": student_id,
         "Text": text
     }
-    
+
     if conversation_id:
         payload["ConversationId"] = conversation_id
-    
+
     print(f"DEBUG: Sending to Prodamus: {payload}")
-    
+
     try:
         response = requests.post(
             f"{PRODAMUS_BASE_URL}/chat-channel/messages",
@@ -116,7 +116,7 @@ def send_prodamus_message(student_id, text, conversation_id=None):
         )
         print(f"DEBUG: Prodamus status={response.status_code}")
         print(f"DEBUG: Response: {response.text[:500]}")
-        
+
         if response.status_code != 200:
             print(f"ERROR: Failed to send: {response.text}")
             return False
@@ -131,26 +131,27 @@ def webhook():
     print("=" * 60)
     print("NEW WEBHOOK REQUEST")
     print("=" * 60)
+    print(f"DEBUG: Method={request.method}, Content-Type={request.content_type}, Content-Length={request.content_length}")
 
     data = {}
-    
+
     if request.is_json and request.content_length and request.content_length > 0:
         data = request.get_json(silent=True) or {}
-    
+
     if not data and request.form:
         data = request.form.to_dict()
-    
+
     if not data:
         data = request.args.to_dict()
 
     print(f"DEBUG: Received data: {data}")
 
     student_id = (
-        data.get("studentId") or data.get("StudentId") 
+        data.get("studentId") or data.get("StudentId")
         or data.get("contactId")
     )
     message_text = (
-        data.get("text") or data.get("Text") 
+        data.get("text") or data.get("Text")
         or data.get("message")
     )
     conversation_id_from_webhook = (
@@ -165,8 +166,14 @@ def webhook():
 
     if not student_id:
         return jsonify({"status": "error", "message": "Missing studentId"}), 400
-    
-    # Если текст — макрос или пустой
+
+    # Тестовые запросы из редактора сценария подставляют буквальную строку "null",
+    # когда нет реального контекста чата - это не настоящее сообщение
+    if str(student_id).lower() == "null":
+        print("WARNING: studentId is literal 'null' - looks like a test request, not a real message")
+        return jsonify({"status": "ignored", "message": "Test request detected"}), 200
+
+    # Если текст - макрос или пустой
     if not message_text or "#" in str(message_text):
         print("WARNING: Message text is macro/missing")
         message_text = "Привет! Чем могу помочь?"
@@ -178,11 +185,11 @@ def webhook():
 
     # 2. Получаем conversationId через API если нет из вебхука
     conversation_id = conversation_id_from_webhook
-    
+
     if not conversation_id or "#" in str(conversation_id):
         print("DEBUG: Getting conversationId via API...")
         conversation_id = get_conversation_id(student_id)
-    
+
     print(f"DEBUG: Final conversation_id: {conversation_id}")
 
     # 3. Отправляем в Prodamus
