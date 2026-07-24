@@ -41,6 +41,58 @@ def call_qwen_api(message_text):
         return "Извините, сейчас я не могу ответить. Попробуйте позже."
 
 
+def get_conversation_id(student_id):
+    """Получаем conversationId через API Prodamus"""
+    
+    url = f"{PRODAMUS_BASE_URL}/chat-channel/messages/recent"
+    params = {
+        "chatChannelId": int(CHAT_CHANNEL_ID),
+        "studentId": student_id,
+        "take": 5
+    }
+    
+    headers = {
+        "Authorization": f"Bearer {PRODAMUS_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    
+    try:
+        response = requests.get(url, headers=headers, params=params, timeout=10)
+        print(f"DEBUG: Get recent messages status={response.status_code}")
+        
+        if response.status_code == 200:
+            data = response.json()
+            
+            # Проверяем что ответ успешный
+            if isinstance(data, dict) and data.get("success"):
+                messages = data.get("value", []) or data.get("data", [])
+                
+                if messages:
+                    # Берём последнее сообщение от этого студента
+                    for msg in reversed(messages):
+                        if isinstance(msg, dict):
+                            sender = msg.get("senderId") or msg.get("SenderId") or msg.get("contactId")
+                            conv_id = msg.get("conversationId") or msg.get("ConversationId")
+                            
+                            if sender == student_id and conv_id:
+                                print(f"DEBUG: Found conversationId={conv_id}")
+                                return conv_id
+                    
+                    # Если не нашли от этого студента — берём любой conversationId
+                    last_msg = messages[-1] if isinstance(messages, list) else messages
+                    if isinstance(last_msg, dict):
+                        conv_id = last_msg.get("conversationId") or last_msg.get("ConversationId")
+                        if conv_id:
+                            print(f"DEBUG: Using last conversationId={conv_id}")
+                            return conv_id
+        
+        print("DEBUG: No conversation found via API")
+        return None
+    except Exception as e:
+        print(f"ERROR: Failed to get conversation from API: {e}")
+        return None
+
+
 def send_prodamus_message(student_id, text, conversation_id=None):
     """Отправляем сообщение в Prodamus"""
     
@@ -50,8 +102,7 @@ def send_prodamus_message(student_id, text, conversation_id=None):
         "Text": text
     }
     
-    # Если conversation_id предоставлен Prodamus — используем его
-    if conversation_id and "#" not in str(conversation_id):
+    if conversation_id:
         payload["ConversationId"] = conversation_id
     
     print(f"DEBUG: Sending to Prodamus: {payload}")
@@ -94,7 +145,6 @@ def webhook():
 
     print(f"DEBUG: Received data: {data}")
 
-    # Извлекаем поля
     student_id = (
         data.get("studentId") or data.get("StudentId") 
         or data.get("contactId")
@@ -103,14 +153,14 @@ def webhook():
         data.get("text") or data.get("Text") 
         or data.get("message")
     )
-    conversation_id = (
+    conversation_id_from_webhook = (
         data.get("chatConversationId") or data.get("conversationId")
         or data.get("ChatConversationId")
     )
 
     print(f"DEBUG: Parsed:")
     print(f"  student_id:       {student_id}")
-    print(f"  conversation_id:  {conversation_id}")
+    print(f"  conversation_id:  {conversation_id_from_webhook}")
     print(f"  message_text:     '{message_text}'")
 
     if not student_id:
@@ -126,7 +176,16 @@ def webhook():
     ai_response = call_qwen_api(message_text)
     print(f"DEBUG: AI response: '{ai_response[:80]}...'")
 
-    # 2. Отправляем в Prodamus с conversation_id если есть
+    # 2. Получаем conversationId через API если нет из вебхука
+    conversation_id = conversation_id_from_webhook
+    
+    if not conversation_id or "#" in str(conversation_id):
+        print("DEBUG: Getting conversationId via API...")
+        conversation_id = get_conversation_id(student_id)
+    
+    print(f"DEBUG: Final conversation_id: {conversation_id}")
+
+    # 3. Отправляем в Prodamus
     success = send_prodamus_message(student_id, ai_response, conversation_id)
 
     if success:
