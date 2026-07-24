@@ -40,8 +40,13 @@ def call_qwen_api(message_text):
         return "Извините, сейчас я не могу ответить."
 
 def send_prodamus_message(chat_channel_id, student_id, text):
+    # Prodamus error log indicates 'ConversationId' is required.
+    # We might need to use chat_channel_id as conversationId or look it up.
+    # Given the docs, let's try mapping chatChannelId to conversationId if necessary,
+    # or adding it to the payload.
     payload = {
         "chatChannelId": chat_channel_id,
+        "conversationId": chat_channel_id, # Trying this mapping based on error
         "studentId": student_id,
         "text": text
     }
