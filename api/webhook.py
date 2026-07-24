@@ -8,7 +8,7 @@ app = Flask(__name__)
 PRODAMUS_API_KEY = os.getenv("PRODAMUS_API_KEY")
 QWEN_API_KEY = os.getenv("QWEN_API_KEY")
 PRODAMUS_BASE_URL = "https://api.xl.ru/api/v1"
-QWEN_API_URL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+QWEN_API_URL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions"
 
 def get_prodamus_headers():
     return {
