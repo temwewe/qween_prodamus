@@ -9,7 +9,6 @@ QWEN_API_KEY = os.getenv("QWEN_API_KEY")
 PRODAMUS_BASE_URL = "https://api.xl.ru/api/v1"
 QWEN_API_URL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions"
 
-# ID из ссылки бота
 CHAT_CHANNEL_ID = os.getenv("CHAT_CHANNEL_ID", "106540")
 
 
@@ -43,47 +42,72 @@ def call_qwen_api(message_text):
 
 
 def send_prodamus_message(student_id, text):
-    """Отправляем сообщение без ConversationId — Prodamus сам найдёт диалог"""
+    """Пробуем разные варианты отправки сообщения"""
     
-    # Пробуем сначала без ConversationId
-    payload = {
+    headers = {
+        "Authorization": f"Bearer {PRODAMUS_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    
+    url = f"{PRODAMUS_BASE_URL}/chat-channel/messages"
+    
+    # Вариант 1: Без ConversationId
+    payload1 = {
         "ChatChannelId": int(CHAT_CHANNEL_ID),
         "StudentId": student_id,
         "Text": text
     }
-
-    print(f"DEBUG: Sending to Prodamus: {payload}")
-
+    
+    print(f"DEBUG: Trying variant 1 (no ConversationId): {payload1}")
+    
     try:
-        response = requests.post(
-            f"{PRODAMUS_BASE_URL}/chat-channel/messages",
-            headers={"Authorization": f"Bearer {PRODAMUS_API_KEY}", "Content-Type": "application/json"},
-            json=payload,
-            timeout=10
-        )
-        print(f"DEBUG: Prodamus status={response.status_code}")
-        print(f"DEBUG: Prodamus response: {response.text[:500]}")
+        response = requests.post(url, headers=headers, json=payload1, timeout=10)
+        print(f"DEBUG: Variant 1 status={response.status_code}")
+        print(f"DEBUG: Variant 1 response: {response.text[:500]}")
         
-        # Если не получилось без ConversationId — пробуем с ChatBotId
-        if response.status_code != 200:
-            print("DEBUG: Trying with ConversationId=102158...")
-            payload["ConversationId"] = "102158"
-            
-            response = requests.post(
-                f"{PRODAMUS_BASE_URL}/chat-channel/messages",
-                headers={"Authorization": f"Bearer {PRODAMUS_API_KEY}", "Content-Type": "application/json"},
-                json=payload,
-                timeout=10
-            )
-            print(f"DEBUG: Prodamus retry status={response.status_code}")
-            print(f"DEBUG: Prodamus retry response: {response.text[:500]}")
+        if response.status_code == 200:
+            return True
         
-        if response.status_code != 200:
-            print(f"ERROR: Prodamus {response.status_code}: {response.text}")
-            return False
-        return True
+        # Вариант 2: С CreateConversationIfNotExists
+        payload2 = {
+            "ChatChannelId": int(CHAT_CHANNEL_ID),
+            "StudentId": student_id,
+            "Text": text,
+            "CreateConversationIfNotExists": True
+        }
+        
+        print(f"DEBUG: Trying variant 2 (CreateConversationIfNotExists): {payload2}")
+        
+        response = requests.post(url, headers=headers, json=payload2, timeout=10)
+        print(f"DEBUG: Variant 2 status={response.status_code}")
+        print(f"DEBUG: Variant 2 response: {response.text[:500]}")
+        
+        if response.status_code == 200:
+            return True
+        
+        # Вариант 3: С IsNewConversation
+        payload3 = {
+            "ChatChannelId": int(CHAT_CHANNEL_ID),
+            "StudentId": student_id,
+            "Text": text,
+            "IsNewConversation": True
+        }
+        
+        print(f"DEBUG: Trying variant 3 (IsNewConversation): {payload3}")
+        
+        response = requests.post(url, headers=headers, json=payload3, timeout=10)
+        print(f"DEBUG: Variant 3 status={response.status_code}")
+        print(f"DEBUG: Variant 3 response: {response.text[:500]}")
+        
+        if response.status_code == 200:
+            return True
+        
+        # Если все варианты не сработали
+        print(f"ERROR: All variants failed. Last error: {response.text}")
+        return False
+        
     except Exception as e:
-        print(f"ERROR: Prodamus failed: {e}")
+        print(f"ERROR: Prodamus request failed: {e}")
         return False
 
 
@@ -93,7 +117,6 @@ def webhook():
     print("NEW WEBHOOK REQUEST")
     print("=" * 60)
 
-    # Читаем данные из любого источника
     data = {}
     
     if request.is_json and request.content_length and request.content_length > 0:
@@ -107,7 +130,6 @@ def webhook():
 
     print(f"DEBUG: Received data: {data}")
 
-    # Извлекаем поля
     student_id = (
         data.get("studentId") or data.get("StudentId") 
         or data.get("student") or data.get("contactId")
@@ -121,14 +143,12 @@ def webhook():
     print(f"  student_id:   {student_id}")
     print(f"  message_text: '{message_text}'")
 
-    # Проверка обязательных полей
     if not student_id:
-        print("ERROR: Missing studentId!")
         return jsonify({"status": "error", "message": "Missing studentId"}), 400
     
-    # Если текст — макрос или пустой, используем заглушку
+    # Если текст — макрос, используем заглушку
     if not message_text or "#" in str(message_text):
-        print("WARNING: Message text is macro/missing, using default")
+        print("WARNING: Message text is macro/missing")
         message_text = "Привет! Чем могу помочь?"
 
     # 1. Получаем ответ от Qwen
@@ -136,7 +156,7 @@ def webhook():
     ai_response = call_qwen_api(message_text)
     print(f"DEBUG: AI response: '{ai_response[:80]}...'")
 
-    # 2. Отправляем в Prodamus
+    # 2. Отправляем в Prodamus (код сам попробует разные варианты)
     success = send_prodamus_message(student_id, ai_response)
 
     if success:
