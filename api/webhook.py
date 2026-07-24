@@ -4,197 +4,142 @@ import os
 
 app = Flask(__name__)
 
-# Переменные окружения
 PRODAMUS_API_KEY = os.getenv("PRODAMUS_API_KEY")
 QWEN_API_KEY = os.getenv("QWEN_API_KEY")
 PRODAMUS_BASE_URL = "https://api.xl.ru/api/v1"
+
+# Полный URL с /chat/completions
 QWEN_API_URL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions"
 
-def get_prodamus_headers():
-    return {
-        "Authorization": f"Bearer {PRODAMUS_API_KEY}",
-        "Content-Type": "application/json"
-    }
-
-def get_qwen_headers():
-    return {
-        "Authorization": f"Bearer {QWEN_API_KEY}",
-        "Content-Type": "application/json"
-    }
 
 def call_qwen_api(message_text):
-    """Вызов Qwen через compatible-mode (OpenAI-совместимый формат)"""
-    
-    # Проверяем, что токен есть
     if not QWEN_API_KEY:
         print("ERROR: QWEN_API_KEY is not set!")
         return "Ошибка: не настроен ключ нейросети."
-    
-    # Compatible-mode использует OpenAI-формат payload
+
     payload = {
         "model": "qwen-plus",
         "messages": [
-            {
-                "role": "system",
-                "content": "Ты - помощник техподдержки школы. Отвечай вежливо и кратко."
-            },
-            {
-                "role": "user",
-                "content": message_text
-            }
+            {"role": "system", "content": "Ты - помощник техподдержки школы. Отвечай вежливо и кратко."},
+            {"role": "user", "content": message_text}
         ]
     }
-    
-    print(f"DEBUG: Calling Qwen API. URL={QWEN_API_URL}")
-    print(f"DEBUG: Qwen payload: {payload}")
-    
+
     try:
         response = requests.post(
             QWEN_API_URL,
-            headers=get_qwen_headers(),
+            headers={"Authorization": f"Bearer {QWEN_API_KEY}", "Content-Type": "application/json"},
             json=payload,
             timeout=30
         )
-        
-        print(f"DEBUG: Qwen response status: {response.status_code}")
-        print(f"DEBUG: Qwen response body: {response.text[:500]}")
-        
+        print(f"DEBUG: Qwen status={response.status_code}")
+        print(f"DEBUG: Qwen body={response.text[:500]}")
         response.raise_for_status()
-        
-        result = response.json()
-        ai_text = result["choices"][0]["message"]["content"]
-        print(f"DEBUG: Qwen answer: {ai_text}")
-        return ai_text
-        
-    except requests.exceptions.HTTPError as e:
-        print(f"ERROR: Qwen HTTP error: {e}")
-        print(f"ERROR: Response: {response.text}")
-        return "Извините, сейчас я не могу ответить. Попробуйте позже."
+        return response.json()["choices"][0]["message"]["content"]
     except Exception as e:
-        print(f"ERROR: Qwen unexpected error: {e}")
-        return "Извините, произошла ошибка. Попробуйте позже."
+        print(f"ERROR: Qwen API failed: {e}")
+        return "Извините, сейчас я не могу ответить. Попробуйте позже."
 
 
-def send_prodamus_message(chat_channel_id, student_id, text, conversation_id=None):
-    """Отправка сообщения в Prodamus"""
-    
+def send_prodamus_message(chat_channel_id, student_id, text, conversation_id):
     if not PRODAMUS_API_KEY:
         print("ERROR: PRODAMUS_API_KEY is not set!")
         return False
-    
-    # Prodamus API требует PascalCase имена полей
+
     payload = {
         "ChatChannelId": chat_channel_id,
         "StudentId": student_id,
-        "Text": text
+        "Text": text,
+        "ConversationId": conversation_id
     }
-    
-    # ConversationId — обязательное поле
-    if conversation_id:
-        payload["ConversationId"] = conversation_id
-    else:
-        print("WARNING: ConversationId is missing!")
-        return False
-    
-    url = f"{PRODAMUS_BASE_URL}/chat-channel/messages"
-    
-    print(f"DEBUG: Sending to Prodamus:")
-    print(f"  URL: {url}")
-    print(f"  Payload: {payload}")
-    
+
     try:
         response = requests.post(
-            url,
-            headers=get_prodamus_headers(),
+            f"{PRODAMUS_BASE_URL}/chat-channel/messages",
+            headers={"Authorization": f"Bearer {PRODAMUS_API_KEY}", "Content-Type": "application/json"},
             json=payload,
             timeout=10
         )
-        
-        print(f"DEBUG: Prodamus response status: {response.status_code}")
-        print(f"DEBUG: Prodamus response: {response.text[:500]}")
-        
         if response.status_code != 200:
-            print(f"ERROR: Prodamus returned {response.status_code}: {response.text}")
+            print(f"ERROR: Prodamus {response.status_code}: {response.text}")
             return False
-            
         return True
-        
     except Exception as e:
-        print(f"ERROR: Failed to send to Prodamus: {e}")
+        print(f"ERROR: Prodamus request failed: {e}")
         return False
 
 
-@app.route('/', methods=['POST'])
+@app.route('/', methods=['POST', 'GET'])
 def webhook():
     print("=" * 60)
     print("NEW WEBHOOK REQUEST")
     print("=" * 60)
-    
-    content_length = request.content_length
-    content_type = request.content_type
-    print(f"DEBUG: Content-Length: {content_length}, Content-Type: {content_type}")
 
-    if not content_length or content_length == 0:
-        return jsonify({"status": "error", "message": "Empty request body"}), 400
+    data = {}
 
-    data = request.get_json(silent=True)
-    
+    # Пробуем JSON
+    if request.is_json and request.content_length and request.content_length > 0:
+        data = request.get_json(silent=True) or {}
+
+    # Если пусто — пробуем form-data
+    if not data and request.form:
+        data = request.form.to_dict()
+
+    # Если всё ещё пусто — URL параметры
     if not data:
-        print(f"ERROR: Failed to parse JSON. Raw body: {request.get_data(as_text=True)[:200]}")
-        return jsonify({"status": "error", "message": "Failed to parse JSON"}), 400
-    
-    print(f"DEBUG: Received JSON: {data}")
-    
-    # Извлекаем поля — пробуем разные варианты именования
-    chat_channel_id = data.get("chatChannelId") or data.get("ChatChannelId")
-    conversation_id = data.get("chatConversationId") or data.get("ChatConversationId") or data.get("conversationId")
-    student_id = data.get("studentId") or data.get("StudentId")
-    message_text = data.get("text") or data.get("Text") or data.get("message")
-    
-    print(f"DEBUG: Parsed fields:")
-    print(f"  chat_channel_id: {chat_channel_id}")
-    print(f"  conversation_id: {conversation_id}")
-    print(f"  student_id: {student_id}")
-    print(f"  message_text: {message_text}")
-    
-    # Проверка обязательных полей
-    missing = []
-    if not conversation_id:
-        missing.append("conversationId")
-    if not student_id:
-        missing.append("studentId")
-    if not message_text:
-        missing.append("text")
-    
-    if missing:
-        print(f"ERROR: Missing required fields: {missing}")
+        data = request.args.to_dict()
+
+    print(f"DEBUG: Received data: {data}")
+
+    chat_channel_id = (
+        data.get("chatChannelId") or data.get("ChatChannelId")
+        or data.get("channelId") or data.get("chat_channel_id")
+    )
+    conversation_id = (
+        data.get("chatConversationId") or data.get("ChatConversationId")
+        or data.get("conversationId") or data.get("chat_conversation_id")
+    )
+    student_id = (
+        data.get("studentId") or data.get("StudentId")
+        or data.get("student_id")
+    )
+    message_text = (
+        data.get("text") or data.get("Text")
+        or data.get("message") or data.get("message_text")
+    )
+
+    print(f"DEBUG: Parsed:")
+    print(f"  chat_channel_id:   {chat_channel_id}")
+    print(f"  conversation_id:   {conversation_id}")
+    print(f"  student_id:        {student_id}")
+    print(f"  message_text:      '{message_text}'")
+
+    # Проверка на макросы
+    if "#" in str(conversation_id) or "#" in str(chat_channel_id):
+        print("ERROR: Macros not substituted! Use form-data in Prodamus webhook.")
         return jsonify({
             "status": "error",
-            "message": f"Missing required fields: {', '.join(missing)}"
+            "message": "Prodamus macros not substituted. Change webhook body to x-www-form-urlencoded."
         }), 400
-    
-    # 1. Получаем ответ от Qwen
-    print(f"DEBUG: Calling Qwen with text: '{message_text[:100]}...'")
+
+    missing = []
+    if not conversation_id: missing.append("conversationId")
+    if not student_id: missing.append("studentId")
+    if not message_text: missing.append("text")
+    if not chat_channel_id: missing.append("chatChannelId")
+
+    if missing:
+        return jsonify({"status": "error", "message": f"Missing: {', '.join(missing)}"}), 400
+
     ai_response = call_qwen_api(message_text)
-    print(f"DEBUG: AI response: '{ai_response[:100]}...'")
-    
-    # 2. Отправляем ответ в Prodamus
-    success = send_prodamus_message(
-        chat_channel_id=chat_channel_id,
-        student_id=student_id,
-        text=ai_response,
-        conversation_id=conversation_id
-    )
-    
+    print(f"DEBUG: AI response: '{ai_response[:80]}...'")
+
+    success = send_prodamus_message(chat_channel_id, student_id, ai_response, conversation_id)
+
     if success:
-        print("SUCCESS: Message sent to Prodamus")
         return jsonify({"status": "success"}), 200
     else:
-        print("ERROR: Failed to send message to Prodamus")
-        return jsonify({
-            "status": "error",
-            "message": "Failed to send response to Prodamus"
-        }), 500
+        return jsonify({"status": "error", "message": "Failed to send to Prodamus"}), 500
 
 
 if __name__ == '__main__':
