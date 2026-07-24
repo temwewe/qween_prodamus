@@ -89,10 +89,14 @@ def webhook():
         return jsonify({"status": "error", "message": "Missing required fields: chatChannelId, studentId, text"}), 400
     
     # 2. Получаем ответ от Qwen
+    print(f"DEBUG: Calling Qwen API with: {message_text}")
     ai_response = call_qwen_api(message_text)
+    print(f"DEBUG: Qwen response: {ai_response}")
     
     # 3. Отправляем ответ в Продамус
+    print(f"DEBUG: Before calling send_prodamus_message")
     success = send_prodamus_message(chat_channel_id, student_id, ai_response)
+    print(f"DEBUG: After calling send_prodamus_message, success={success}")
     
     if success:
         return jsonify({"status": "success"}), 200
