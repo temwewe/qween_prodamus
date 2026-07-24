@@ -39,17 +39,19 @@ def call_qwen_api(message_text):
         print(f"Error calling Qwen API: {e}")
         return "Извините, сейчас я не могу ответить."
 
-def send_prodamus_message(chat_channel_id, student_id, text):
+def send_prodamus_message(chat_channel_id, student_id, text, conversation_id=None):
     # Prodamus error log indicates 'ConversationId' is required.
-    # We might need to use chat_channel_id as conversationId or look it up.
-    # Given the docs, let's try mapping chatChannelId to conversationId if necessary,
-    # or adding it to the payload.
+    # If not provided, we must determine it. 
+    # Let's try sending conversationId if we have it, 
+    # or leave it out if we don't (though the API says it's required).
     payload = {
         "chatChannelId": chat_channel_id,
-        "conversationId": chat_channel_id, # Trying this mapping based on error
         "studentId": student_id,
         "text": text
     }
+    if conversation_id:
+        payload["conversationId"] = conversation_id
+        
     print(f"DEBUG: Sending to Prodamus: URL={PRODAMUS_BASE_URL}/chat-channel/messages, Payload={payload}, Headers={HEADERS_PRODAMUS}")
     try:
         # POST /api/v1/chat-channel/messages
@@ -76,22 +78,25 @@ def webhook():
     print(f"DEBUG: Received JSON payload: {data}")
     
     if not data:
-        # If get_json failed, it might be because the Content-Type is not application/json
-        # or the body is not valid JSON.
-        raw_data = request.get_data(as_text=True)
-        print(f"DEBUG: Raw data that failed to parse: {raw_data}")
         return jsonify({"status": "error", "message": "Failed to parse JSON"}), 400
     
-    # Based on the Prodamus API docs for 'POST /api/v1/chat-channel/messages'
-    # we need chatChannelId, studentId, and text. 
-    chat_channel_id = data.get("chatChannelId")
+    # Based on the log provided by the user:
+    # {
+    #   "studentId": "rJpHtD2ug027qwoaXOlzYQ",
+    #   "chatBotId": "hDGeDv-n20OeH0Aybq3F1A",
+    #   "chatConversationId": "ZV_S73nN6EakWjivGKih6A"
+    # }
+    # Also need text, presumably from the webhook trigger event.
+    
+    chat_channel_id = data.get("chatChannelId") # If still present
+    conversation_id = data.get("chatConversationId")
     student_id = data.get("studentId")
-    message_text = data.get("text")
+    message_text = data.get("text") # Assuming 'text' is sent in the webhook data
     
-    print(f"DEBUG: Parsed - chat_channel_id: {chat_channel_id}, student_id: {student_id}, text: {message_text}")
+    print(f"DEBUG: Parsed - chat_channel_id: {chat_channel_id}, conversation_id: {conversation_id}, student_id: {student_id}, text: {message_text}")
     
-    if not chat_channel_id or not student_id or not message_text:
-        return jsonify({"status": "error", "message": "Missing required fields: chatChannelId, studentId, text"}), 400
+    if not conversation_id or not student_id or not message_text:
+        return jsonify({"status": "error", "message": "Missing required fields: chatConversationId, studentId, text"}), 400
     
     # 2. Получаем ответ от Qwen
     print(f"DEBUG: Calling Qwen API with: {message_text}")
@@ -100,7 +105,8 @@ def webhook():
     
     # 3. Отправляем ответ в Продамус
     print(f"DEBUG: Before calling send_prodamus_message")
-    success = send_prodamus_message(chat_channel_id, student_id, ai_response)
+    # Using conversation_id as required by the API
+    success = send_prodamus_message(chat_channel_id, student_id, ai_response, conversation_id=conversation_id)
     print(f"DEBUG: After calling send_prodamus_message, success={success}")
     
     if success:
