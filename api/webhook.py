@@ -9,7 +9,8 @@ QWEN_API_KEY = os.getenv("QWEN_API_KEY")
 PRODAMUS_BASE_URL = "https://api.xl.ru/api/v1"
 QWEN_API_URL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions"
 
-CHAT_CHANNEL_ID = os.getenv("CHAT_CHANNEL_ID", "106540")
+# Используется только как fallback, если chatChannelId не пришёл в вебхуке
+DEFAULT_CHAT_CHANNEL_ID = os.getenv("CHAT_CHANNEL_ID", "AVmLK7Mvd0qzLMsqzADQCA")
 
 
 def call_qwen_api(message_text):
@@ -41,12 +42,12 @@ def call_qwen_api(message_text):
         return "Извините, сейчас я не могу ответить. Попробуйте позже."
 
 
-def get_conversation_id(student_id):
+def get_conversation_id(chat_channel_id, student_id):
     """Получаем conversationId через API Prodamus.
 
     ВАЖНО: ответ этого эндпоинта - это ОДИН объект последнего сообщения,
     а не список и не {success, body}. conversationId лежит прямо на
-    верхнем уровне ответа. См. пример ответа в документации:
+    верхнем уровне ответа:
 
     {
       "id": null,
@@ -61,7 +62,7 @@ def get_conversation_id(student_id):
 
     url = f"{PRODAMUS_BASE_URL}/chat-channel/messages/recent"
     params = {
-        "chatChannelId": int(CHAT_CHANNEL_ID),
+        "chatChannelId": chat_channel_id,
         "studentId": student_id,
         "take": 5
     }
@@ -93,11 +94,11 @@ def get_conversation_id(student_id):
         return None
 
 
-def send_prodamus_message(student_id, text, conversation_id=None):
+def send_prodamus_message(chat_channel_id, student_id, text, conversation_id=None):
     """Отправляем сообщение в Prodamus"""
 
     payload = {
-        "ChatChannelId": int(CHAT_CHANNEL_ID),
+        "ChatChannelId": chat_channel_id,
         "StudentId": student_id,
         "Text": text
     }
@@ -158,9 +159,14 @@ def webhook():
         data.get("chatConversationId") or data.get("conversationId")
         or data.get("ChatConversationId")
     )
+    chat_channel_id = (
+        data.get("chatChannelId") or data.get("ChatChannelId")
+        or DEFAULT_CHAT_CHANNEL_ID
+    )
 
     print(f"DEBUG: Parsed:")
     print(f"  student_id:       {student_id}")
+    print(f"  chat_channel_id:  {chat_channel_id}")
     print(f"  conversation_id:  {conversation_id_from_webhook}")
     print(f"  message_text:     '{message_text}'")
 
@@ -188,12 +194,12 @@ def webhook():
 
     if not conversation_id or "#" in str(conversation_id):
         print("DEBUG: Getting conversationId via API...")
-        conversation_id = get_conversation_id(student_id)
+        conversation_id = get_conversation_id(chat_channel_id, student_id)
 
     print(f"DEBUG: Final conversation_id: {conversation_id}")
 
     # 3. Отправляем в Prodamus
-    success = send_prodamus_message(student_id, ai_response, conversation_id)
+    success = send_prodamus_message(chat_channel_id, student_id, ai_response, conversation_id)
 
     if success:
         print("SUCCESS: Message sent!")
