@@ -241,7 +241,7 @@ def notify_human(student_id, message_text, ai_reply):
 
     text = (
         "🔔 Нужен человек в чате поддержки\n\n"
-        f"Студент (ID): {student_id}\n"
+        f"Студент (ID): {student_id} #Contact.Email# #Contact.FirstName# #Contact.LastName#\n"
         f"Сообщение студента: {message_text}\n\n"
         f"Ответ бота студенту: {ai_reply}"
     )
