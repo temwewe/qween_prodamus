@@ -249,24 +249,22 @@ def fetch_full_contact(student_id):
     2) получить email/имя для уведомления, и текущие поля контакта,
        чтобы потом безопасно вернуть их обратно при PUT (не потерять данные)
 
-    ВАЖНО: поле "attributes" сюда намеренно НЕ включено - оно вложенная коллекция
-    пользовательских атрибутов и требует явного указания вложенных полей
-    (иначе API отвечает 500 "Nested fields ... must be specified"). Для наших целей
-    (проверка/простановка тега) оно и не нужно.
+    ВАЖНО: поле "attributes" может вызывать 500 "Nested fields ... must be specified"
+    если запрашивать его без указания вложенных полей. Чтобы не рисковать потерей
+    каких-либо полей контакта (включая теги), запрос идёт БЕЗ фильтра fields -
+    получаем контакт полностью, как его видит сама платформа.
 
-    GET /api/v1/crm/lead/{id}?fields={...}
+    GET /api/v1/crm/lead/{id}
     """
 
-    fields = "{id,email,firstName,middleName,lastName,phone,comment,country,birthday,tags,groups}"
     url = f"{PRODAMUS_BASE_URL}/crm/lead/{student_id}"
-    params = {"fields": fields}
     headers = {
         "Authorization": f"Bearer {PRODAMUS_API_KEY}",
         "Content-Type": "application/json"
     }
 
     try:
-        response = requests.get(url, headers=headers, params=params, timeout=10)
+        response = requests.get(url, headers=headers, timeout=10)
         print(f"DEBUG: Get contact status={response.status_code}")
         print(f"DEBUG: Get contact body: {response.text[:800]}")
 
