@@ -10,9 +10,19 @@ QWEN_API_KEY = os.getenv("QWEN_API_KEY")
 PRODAMUS_BASE_URL = "https://api.xl.ru/api/v1"
 QWEN_API_URL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions"
 
-# Telegram-уведомления, когда нужен человек
+# Telegram-уведомления, когда нужен человек.
+# TELEGRAM_CHAT_IDS - список ID через запятую, например: "111111111,222222222"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TELEGRAM_CHAT_IDS = [
+    chat_id.strip()
+    for chat_id in os.getenv("TELEGRAM_CHAT_IDS", "1680259524").split(",")
+    if chat_id.strip()
+]
+
+# Тег, которым помечаем контакт, пока с ним общается человек -
+# пока тег стоит, нейросеть не отвечает этому студенту.
+# Уберите тег вручную в карточке контакта в Prodamus, когда разговор с человеком завершён.
+AI_PAUSED_TAG = "ai_paused"
 
 # Используется только как fallback, если chatChannelId не пришёл в вебхуке
 DEFAULT_CHAT_CHANNEL_ID = os.getenv("CHAT_CHANNEL_ID", "AVmLK7Mvd0qzLMsqzADQCA")
@@ -232,36 +242,122 @@ Max-группа школы: https://max.ru/id301724845154_biz
 """
 
 
-def notify_human(student_id, message_text, ai_reply):
-    """Отправляем уведомление в Telegram, что нужен человек"""
+def fetch_full_contact(student_id):
+    """
+    Читаем контакт целиком через CRM API Prodamus - нужно для двух вещей:
+    1) проверить, не стоит ли уже тег AI_PAUSED_TAG (тогда бот молчит)
+    2) получить email/имя для уведомления, и текущие поля контакта,
+       чтобы потом безопасно вернуть их обратно при PUT (не потерять данные)
 
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("WARNING: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not configured, skipping notification")
+    GET /api/v1/crm/lead/{id}?fields={...}
+    """
+
+    fields = "{id,email,firstName,middleName,lastName,phone,comment,country,birthday,tags,groups,attributes}"
+    url = f"{PRODAMUS_BASE_URL}/crm/lead/{student_id}"
+    params = {"fields": fields}
+    headers = {
+        "Authorization": f"Bearer {PRODAMUS_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    try:
+        response = requests.get(url, headers=headers, params=params, timeout=10)
+        print(f"DEBUG: Get contact status={response.status_code}")
+        print(f"DEBUG: Get contact body: {response.text[:800]}")
+
+        if response.status_code == 200:
+            data = response.json()
+            return data.get("body") or {}
+
+        return None
+    except Exception as e:
+        print(f"ERROR: Failed to fetch contact info: {e}")
+        return None
+
+
+def contact_is_ai_paused(contact):
+    if not contact:
         return False
+    tags = contact.get("tags") or []
+    return AI_PAUSED_TAG in tags
+
+
+def add_ai_paused_tag(contact):
+    """
+    Добавляем тег AI_PAUSED_TAG к уже прочитанному контакту и отправляем
+    ВЕСЬ объект контакта обратно через PUT (read-merge-write), чтобы не
+    затереть остальные поля контакта (email, phone, groups и т.д.)
+    """
+
+    if not contact:
+        return False
+
+    tags = list(contact.get("tags") or [])
+    if AI_PAUSED_TAG not in tags:
+        tags.append(AI_PAUSED_TAG)
+
+    updated_contact = dict(contact)
+    updated_contact["tags"] = tags
+
+    url = f"{PRODAMUS_BASE_URL}/crm/lead"
+    headers = {
+        "Authorization": f"Bearer {PRODAMUS_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    try:
+        response = requests.put(url, headers=headers, json=updated_contact, timeout=10)
+        print(f"DEBUG: Update contact (add tag) status={response.status_code}")
+        print(f"DEBUG: Update contact body: {response.text[:500]}")
+        return response.status_code == 200
+    except Exception as e:
+        print(f"ERROR: Failed to update contact tags: {e}")
+        return False
+
+
+def notify_human(contact, student_id, message_text, ai_reply):
+    """Отправляем уведомление всем настроенным админам в Telegram, что нужен человек"""
+
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_IDS:
+        print("WARNING: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_IDS not configured, skipping notification")
+        return False
+
+    contact = contact or {}
+    full_name = " ".join(
+        part for part in [contact.get("firstName"), contact.get("lastName")] if part
+    ) or "неизвестно"
+    email = contact.get("email") or "неизвестно"
 
     text = (
         "🔔 Нужен человек в чате поддержки\n\n"
-        f"Студент (ID): {student_id} #Contact.Email# #Contact.FirstName# #Contact.LastName#\n"
+        f"Студент: {full_name}\n"
+        f"Email: {email}\n"
+        f"ID студента: {student_id}\n\n"
         f"Сообщение студента: {message_text}\n\n"
-        f"Ответ бота студенту: {ai_reply}"
+        f"Ответ бота студенту: {ai_reply}\n\n"
+        f"⚠️ Бот поставлен на паузу для этого контакта (тег \"{AI_PAUSED_TAG}\"). "
+        "Снимите тег в карточке контакта в Prodamus, когда закончите общение."
     )
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    all_ok = True
 
-    try:
-        response = requests.post(
-            url,
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
-            timeout=10
-        )
-        print(f"DEBUG: Telegram notify status={response.status_code}")
-        if response.status_code != 200:
-            print(f"ERROR: Telegram notify failed: {response.text}")
-            return False
-        return True
-    except Exception as e:
-        print(f"ERROR: Telegram notify exception: {e}")
-        return False
+    for chat_id in TELEGRAM_CHAT_IDS:
+        try:
+            response = requests.post(
+                url,
+                json={"chat_id": chat_id, "text": text},
+                timeout=10
+            )
+            print(f"DEBUG: Telegram notify to {chat_id} status={response.status_code}")
+            if response.status_code != 200:
+                print(f"ERROR: Telegram notify to {chat_id} failed: {response.text}")
+                all_ok = False
+        except Exception as e:
+            print(f"ERROR: Telegram notify to {chat_id} exception: {e}")
+            all_ok = False
+
+    return all_ok
 
 
 def call_qwen_api(message_text):
@@ -469,6 +565,15 @@ def webhook():
         print("WARNING: studentId is literal 'null' - looks like a test request, not a real message")
         return jsonify({"status": "ignored", "message": "Test request detected"}), 200
 
+    # Читаем контакт один раз - используем и для проверки паузы, и для email/имени в уведомлении,
+    # и как базу для безопасного read-merge-write при простановке тега
+    contact = fetch_full_contact(student_id)
+
+    # Если бот уже на паузе для этого контакта (человек ведёт диалог вручную) - не отвечаем вообще
+    if contact_is_ai_paused(contact):
+        print(f"DEBUG: AI is paused for this contact (tag '{AI_PAUSED_TAG}' present) - skipping")
+        return jsonify({"status": "ignored", "message": "AI paused for this contact"}), 200
+
     # Если текст - макрос или пустой
     if not message_text or "#" in str(message_text):
         print("WARNING: Message text is macro/missing")
@@ -479,9 +584,10 @@ def webhook():
     ai_response, needs_human = call_qwen_api(message_text)
     print(f"DEBUG: AI response: '{ai_response[:80]}...' needs_human={needs_human}")
 
-    # 1.5 Если нужен человек - уведомляем в Telegram
+    # 1.5 Если нужен человек - ставим контакту тег паузы и уведомляем в Telegram
     if needs_human:
-        notify_human(student_id, message_text, ai_response)
+        add_ai_paused_tag(contact)
+        notify_human(contact, student_id, message_text, ai_response)
 
     # 2. Получаем conversationId через API если нет из вебхука
     conversation_id = conversation_id_from_webhook
