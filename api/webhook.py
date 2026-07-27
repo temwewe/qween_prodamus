@@ -15,7 +15,7 @@ QWEN_API_URL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/comp
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_IDS = [
     chat_id.strip()
-    for chat_id in os.getenv("TELEGRAM_CHAT_IDS", "1680259524").split(",")
+    for chat_id in os.getenv("TELEGRAM_CHAT_IDS", "").split(",")
     if chat_id.strip()
 ]
 
@@ -249,10 +249,15 @@ def fetch_full_contact(student_id):
     2) получить email/имя для уведомления, и текущие поля контакта,
        чтобы потом безопасно вернуть их обратно при PUT (не потерять данные)
 
+    ВАЖНО: поле "attributes" сюда намеренно НЕ включено - оно вложенная коллекция
+    пользовательских атрибутов и требует явного указания вложенных полей
+    (иначе API отвечает 500 "Nested fields ... must be specified"). Для наших целей
+    (проверка/простановка тега) оно и не нужно.
+
     GET /api/v1/crm/lead/{id}?fields={...}
     """
 
-    fields = "{id,email,firstName,middleName,lastName,phone,comment,country,birthday,tags,groups,attributes}"
+    fields = "{id,email,firstName,middleName,lastName,phone,comment,country,birthday,tags,groups}"
     url = f"{PRODAMUS_BASE_URL}/crm/lead/{student_id}"
     params = {"fields": fields}
     headers = {
@@ -431,19 +436,27 @@ def call_qwen_api(message_text):
 def get_conversation_id(chat_channel_id, student_id):
     """Получаем conversationId через API Prodamus.
 
-    ВАЖНО: ответ этого эндпоинта - это ОДИН объект последнего сообщения,
-    а не список и не {success, body}. conversationId лежит прямо на
-    верхнем уровне ответа:
-
+    Реальная структура ответа:
     {
-      "id": null,
-      "conversationId": null,
-      "text": null,
-      "fromChatUserId": null,
-      "user": {...},
-      "createdDate": "...",
-      "updatedDate": null
+      "success": true,
+      "errors": [],
+      "body": {
+        "items": [
+          {
+            "id": "...",
+            "conversationId": "...",
+            "text": "...",
+            "user": {"contact": {"id": "...", ...}},
+            ...
+          },
+          ...
+        ]
+      },
+      "resetToken": false
     }
+
+    conversationId лежит внутри каждого элемента body.items - берём первый элемент,
+    у которого он есть (по возможности - совпадающий по studentId).
     """
 
     url = f"{PRODAMUS_BASE_URL}/chat-channel/messages/recent"
@@ -461,17 +474,26 @@ def get_conversation_id(chat_channel_id, student_id):
     try:
         response = requests.get(url, headers=headers, params=params, timeout=10)
         print(f"DEBUG: Get recent messages status={response.status_code}")
-        print(f"DEBUG: Get recent messages body: {response.text[:500]}")
+        print(f"DEBUG: Get recent messages body: {response.text[:800]}")
 
         if response.status_code == 200:
             data = response.json()
+            items = (data.get("body") or {}).get("items") or []
 
-            # conversationId лежит на верхнем уровне ответа
-            conv_id = data.get("conversationId") or data.get("ConversationId")
+            # Сначала пробуем найти сообщение именно от нужного студента
+            for item in items:
+                contact = (item.get("user") or {}).get("contact") or {}
+                if contact.get("id") == student_id and item.get("conversationId"):
+                    conv_id = item["conversationId"]
+                    print(f"DEBUG: Found conversationId (matched student)={conv_id}")
+                    return conv_id
 
-            if conv_id:
-                print(f"DEBUG: Found conversationId={conv_id}")
-                return conv_id
+            # Если не нашли точное совпадение - берём первый попавшийся conversationId
+            for item in items:
+                if item.get("conversationId"):
+                    conv_id = item["conversationId"]
+                    print(f"DEBUG: Found conversationId (first available)={conv_id}")
+                    return conv_id
 
         print("DEBUG: No conversation found via API")
         return None
