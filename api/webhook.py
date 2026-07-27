@@ -301,8 +301,12 @@ def add_ai_paused_tag(contact):
     if AI_PAUSED_TAG not in tags:
         tags.append(AI_PAUSED_TAG)
 
+    # Эта модель API использует Optional<T> для полей-коллекций - сервер требует
+    # обёртку {"value": [...]}, а не голый JSON-массив (иначе 400 invalidModel).
     updated_contact = dict(contact)
-    updated_contact["tags"] = tags
+    updated_contact["tags"] = {"value": tags}
+    if "groups" in updated_contact:
+        updated_contact["groups"] = {"value": updated_contact.get("groups") or []}
 
     url = f"{PRODAMUS_BASE_URL}/crm/lead"
     headers = {
