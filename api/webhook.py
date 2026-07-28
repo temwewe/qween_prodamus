@@ -308,17 +308,26 @@ def contact_is_ai_paused(contact):
     return AI_PAUSED_TAG in tags
 
 
-def add_ai_paused_tag(contact):
+def add_ai_paused_tag(contact, known_current_tags=None):
     """
-    Добавляем тег AI_PAUSED_TAG к уже прочитанному контакту и отправляем
-    ВЕСЬ объект контакта обратно через PUT (read-merge-write), чтобы не
-    затереть остальные поля контакта (email, phone, groups и т.д.)
+    Добавляем тег AI_PAUSED_TAG и отправляем ВЕСЬ объект контакта обратно через PUT
+    (read-merge-write), чтобы не затереть остальные поля контакта.
+
+    ВАЖНО: GET /crm/lead/{id} на стороне Prodamus иногда возвращает ПУСТОЙ список tags,
+    даже если у контакта реально есть теги (подтверждено логами - тот же контакт в тот же
+    момент показывает теги через макрос #Contact.Tags# в сценарии, но не через этот API).
+    Поэтому если known_current_tags передан (например, теги из тела вебхука через
+    #Contact.Tags#) - используем ИХ как источник правды, а не contact["tags"] из GET.
     """
 
     if not contact:
         return False
 
-    tags = list(contact.get("tags") or [])
+    if known_current_tags is not None:
+        tags = list(known_current_tags)
+    else:
+        tags = list(contact.get("tags") or [])
+
     if AI_PAUSED_TAG not in tags:
         tags.append(AI_PAUSED_TAG)
 
@@ -636,7 +645,7 @@ def webhook():
     # каждого сообщения - экономим вызовы API в обычном случае.
     if needs_human:
         contact = fetch_full_contact(student_id)
-        add_ai_paused_tag(contact)
+        add_ai_paused_tag(contact, known_current_tags=tags_from_webhook)
         notify_human(contact, student_id, message_text, ai_response)
 
     # 2. Получаем conversationId через API если нет из вебхука
