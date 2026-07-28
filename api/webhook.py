@@ -242,6 +242,27 @@ Max-группа школы: https://max.ru/id301724845154_biz
 """
 
 
+def parse_tags(raw):
+    """
+    Парсим строку тегов, пришедшую из макроса #Contact.Tags# в теле вебхука.
+    Формат резолва макроса заранее не известен (через запятую? JSON-массив?
+    через точку с запятой?), поэтому парсер гибкий - обрабатывает разные варианты.
+    """
+    if not raw:
+        return []
+
+    text = str(raw).strip()
+
+    # Если это похоже на JSON-массив - снимаем внешние скобки
+    if text.startswith("[") and text.endswith("]"):
+        text = text[1:-1]
+
+    # Разбиваем по запятой или точке с запятой
+    import re
+    parts = re.split(r"[,;]", text)
+    return [p.strip().strip('"').strip("'") for p in parts if p.strip()]
+
+
 def fetch_full_contact(student_id):
     """
     Читаем контакт целиком через CRM API Prodamus - нужно для двух вещей:
@@ -249,22 +270,24 @@ def fetch_full_contact(student_id):
     2) получить email/имя для уведомления, и текущие поля контакта,
        чтобы потом безопасно вернуть их обратно при PUT (не потерять данные)
 
-    ВАЖНО: поле "attributes" может вызывать 500 "Nested fields ... must be specified"
-    если запрашивать его без указания вложенных полей. Чтобы не рисковать потерей
-    каких-либо полей контакта (включая теги), запрос идёт БЕЗ фильтра fields -
-    получаем контакт полностью, как его видит сама платформа.
+    ВАЖНО: поле "attributes" сюда намеренно НЕ включено - оно вложенная коллекция
+    пользовательских атрибутов и требует явного указания вложенных полей
+    (иначе API отвечает 500 "Nested fields ... must be specified"). Без параметра
+    fields вообще API отвечает 400 "mustSpecifyFieldsToSelect" - он обязателен.
 
-    GET /api/v1/crm/lead/{id}
+    GET /api/v1/crm/lead/{id}?fields={...}
     """
 
+    fields = "{id,email,firstName,middleName,lastName,phone,comment,country,birthday,tags,groups}"
     url = f"{PRODAMUS_BASE_URL}/crm/lead/{student_id}"
+    params = {"fields": fields}
     headers = {
         "Authorization": f"Bearer {PRODAMUS_API_KEY}",
         "Content-Type": "application/json"
     }
 
     try:
-        response = requests.get(url, headers=headers, timeout=10)
+        response = requests.get(url, headers=headers, params=params, timeout=10)
         print(f"DEBUG: Get contact status={response.status_code}")
         print(f"DEBUG: Get contact body: {response.text[:800]}")
 
@@ -573,12 +596,14 @@ def webhook():
         data.get("chatChannelId") or data.get("ChatChannelId")
         or DEFAULT_CHAT_CHANNEL_ID
     )
+    tags_from_webhook = parse_tags(data.get("tags") or data.get("Tags"))
 
     print(f"DEBUG: Parsed:")
     print(f"  student_id:       {student_id}")
     print(f"  chat_channel_id:  {chat_channel_id}")
     print(f"  conversation_id:  {conversation_id_from_webhook}")
     print(f"  message_text:     '{message_text}'")
+    print(f"  tags_from_webhook: {tags_from_webhook}")
 
     if not student_id:
         return jsonify({"status": "error", "message": "Missing studentId"}), 400
@@ -589,13 +614,11 @@ def webhook():
         print("WARNING: studentId is literal 'null' - looks like a test request, not a real message")
         return jsonify({"status": "ignored", "message": "Test request detected"}), 200
 
-    # Читаем контакт один раз - используем и для проверки паузы, и для email/имени в уведомлении,
-    # и как базу для безопасного read-merge-write при простановке тега
-    contact = fetch_full_contact(student_id)
-
-    # Если бот уже на паузе для этого контакта (человек ведёт диалог вручную) - не отвечаем вообще
-    if contact_is_ai_paused(contact):
-        print(f"DEBUG: AI is paused for this contact (tag '{AI_PAUSED_TAG}' present) - skipping")
+    # Проверка паузы - сначала по тегам из САМОГО ВЕБХУКА (через #Contact.Tags# в теле
+    # запроса сценария), это та же "правда", что видна в UI. Не тратим вызов API,
+    # если тег уже виден прямо в пришедших данных.
+    if AI_PAUSED_TAG in tags_from_webhook:
+        print(f"DEBUG: AI is paused for this contact (tag '{AI_PAUSED_TAG}' found in webhook tags) - skipping")
         return jsonify({"status": "ignored", "message": "AI paused for this contact"}), 200
 
     # Если текст - макрос или пустой
@@ -608,8 +631,11 @@ def webhook():
     ai_response, needs_human = call_qwen_api(message_text)
     print(f"DEBUG: AI response: '{ai_response[:80]}...' needs_human={needs_human}")
 
-    # 1.5 Если нужен человек - ставим контакту тег паузы и уведомляем в Telegram
+    # 1.5 Если нужен человек - читаем контакт через API (email/имя + база для read-merge-write),
+    # ставим тег паузы и уведомляем в Telegram. Контакт читаем только сейчас, а не для
+    # каждого сообщения - экономим вызовы API в обычном случае.
     if needs_human:
+        contact = fetch_full_contact(student_id)
         add_ai_paused_tag(contact)
         notify_human(contact, student_id, message_text, ai_response)
 
