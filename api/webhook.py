@@ -2,6 +2,9 @@ from flask import Flask, request, jsonify
 import requests
 import os
 import json
+import re
+import time
+from html import unescape
 
 app = Flask(__name__)
 
@@ -29,11 +32,13 @@ DEFAULT_CHAT_CHANNEL_ID = os.getenv("CHAT_CHANNEL_ID", "AVmLK7Mvd0qzLMsqzADQCA")
 
 # ============================================================
 # ОБЩАЯ БАЗА ЗНАНИЙ О ШКОЛЕ TIMOFEEVA-ONLINE
-# Этот текст видит нейросеть при ответе на КАЖДОЕ сообщение
-# от ЛЮБОГО студента. Редактируйте прямо здесь и деплойте заново,
-# чтобы обновить данные (даты стартов, цены, статусы продуктов и т.д.)
+# Этот текст видит нейросеть при ответе на КАЖДОЕ сообщение от ЛЮБОГО студента.
+# Курсы/тарифы/цены сюда больше вписывать не нужно - они тянутся из Prodamus
+# автоматически (см. build_catalog_text() ниже). Здесь остаётся то, чего в API
+# нет: общие сведения о школе, оплата, лояльность, сертификаты, FAQ и правила,
+# когда звать человека. Правьте прямо здесь и деплойте заново.
 # ============================================================
-SCHOOL_INFO = """
+SCHOOL_INFO_INTRO = """
 === О ШКОЛЕ ===
 Название: TIMOFEEVA-ONLINE
 Тематика: онлайн-курсы, интенсивы и материалы по ультразвуковой диагностике (УЗД) для врачей.
@@ -51,63 +56,173 @@ Max-группа школы: https://max.ru/id301724845154_biz
 УЗ-аппарат для обучения не обязателен, но желателен для отработки практики.
 Даты старта продаж курса всегда открываются примерно за 1 месяц до начала обучения.
 Расписание уроков — фиксированные даты, привязаны к дате старта потока.
+"""
 
-=== КУРСЫ (3) ===
 
-1) «Дифференциальная УЗД лимфаденопатий» (иногда называют коротко «ЛАП»)
-Описание: разбор вопросов от настроек аппарата до дифференциальной диагностики
-метастазов, лимфаденитов и реактивных изменений.
-Страница курса: https://timofeeva-online.ru/lymph2
-Лист ожидания (если сейчас не в продаже): https://store.timofeeva-online.ru/wlymph
-Старт ближайшего потока: февраль 2027
-Тарифы:
-  - Базовый: доступ 2 месяца, от 12 900 ₽. Без онлайн-встреч.
-  - Погружение: доступ 3 месяца, от 14 900 ₽. Включает "лимфопедию" (атлас УЗ-изображений
-    поверхностных лимфоузлов), мастер-урок с примерами протоколов УЗИ, больше тем уроков,
-    есть одна онлайн-встреча, гайд (памятка) по всему курсу, её можно скачать.
+# ============================================================
+# КАТАЛОГ КУРСОВ И ПРОДУКТОВ - ТЯНЕТСЯ АВТОМАТИЧЕСКИ ИЗ PRODAMUS API
+# Раньше этот раздел был текстом, который редактировали вручную в коде.
+# Теперь актуальные курсы, тарифы, цены, даты стартов потоков и статусы
+# публикации читаются напрямую из Prodamus (GET /course и GET /product) -
+# правьте их в админке школы, а не здесь. Результат кэшируется на
+# CATALOG_CACHE_TTL_SECONDS секунд, чтобы не дёргать API на каждое сообщение.
+# ============================================================
 
-2) «УЗИ щитовидной железы: от нормы до патологии»
-Описание: разбор сложных тем и спорных вопросов — EU TI-RADS, тиреоидиты, узловые
-образования, лимфоузлы, эластография, гайд (памятка) по всему курсу (можно скачать)
-и протоколы описания. В курс входит атлас "Эхограммы верифицированных узлов щитовидной железы".
-Длительность: 3 месяца. Цена: от 14 500 ₽. Один тариф (без деления).
-Страница курса: https://timofeeva-online.ru/thyroid
-Лист ожидания: https://store.timofeeva-online.ru/wthyroid
-Старт ближайшего потока: 8 сентября 2026
-Также может быть полезен врачам-эндокринологам (не только УЗД).
+CATALOG_CACHE_TTL_SECONDS = int(os.getenv("CATALOG_CACHE_TTL_SECONDS", "900"))  # 15 минут
 
-3) «Селезёнка — забытый остров»
-Описание: онлайн-курс о самом недооценённом органе брюшной полости — от анатомии
-и сосудов до травм и редких казусов, есть чат курса.
-Длительность: 3 месяца. Цена: от 6 000 ₽. Один тариф, без онлайн-встреч.
-Страница курса: https://timofeeva-online.ru/spleen
-Лист ожидания: https://store.timofeeva-online.ru/wspleen
-Статус: сейчас не в открытой продаже, активного набора на новый поток нет.
+_catalog_cache = {"text": "", "fetched_at": 0.0}
 
-=== ИНТЕНСИВЫ (3, каждый длится 2 недели, без фиксированных дат старта — доступны всегда) ===
+CURRENCY_SYMBOLS = {"rub": "₽", "usd": "$", "eur": "€", "byn": "Br", "kzt": "₸"}
 
-1) «Уровни лимфоузлов шеи» — 1 850 ₽, доступен
-   Разбор: зачем и как пользоваться делением шеи на уровни при УЗИ лимфоузлов.
 
-2) «O-RADS: от признака до категории» — от 3 900 ₽, статус "скоро"
-   Разбор подводных камней и сложностей системы O-RADS.
+def _strip_html(text):
+    """Описания в Prodamus - это HTML. Для промпта модели превращаем в чистый текст."""
+    if not text:
+        return ""
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = unescape(text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n\s*\n+", "\n", text)
+    return text.strip()
 
-3) «EU TI-RADS: от признака к категории» — 2 500 ₽, статус "пока не доступен"
-   Содержание: 10 микро-уроков по 5-10 минут, перевод гайдлайна EU TI-RADS 2017,
-   пример структурированного протокола, закрытый чат с автором курса.
 
-=== ДРУГИЕ ПРОДУКТЫ ===
+def _format_price(item):
+    price = item.get("price")
+    if price is None:
+        return "цена не указана"
+    currency = (item.get("currency") or "rub").lower()
+    symbol = CURRENCY_SYMBOLS.get(currency, currency.upper())
+    return f"{price:,.0f} {symbol}".replace(",", " ")
 
-- Чек-лист по описанию грудных имплантатов на УЗИ — 1 000 ₽, доступен, даётся навсегда.
-  Содержит пошаговый алгоритм и визуальные примеры нормы и патологии.
 
-- Закрытый Telegram-канал УЗ-диагноста (алгоритмы, библиотека, комьюнити) —
-  5 500 ₽/год, доступ на 1 год, 1000+ материалов.
-  Доступ выдаётся сразу после оплаты — ссылка на вступление приходит на почту, указанную
-  при заказе. Внутри библиотеки уже 1000+ материалов: готовые алгоритмы по УЗД в гинекологии,
-  уронефрологии, гепатобилиарной зоны и поверхностно расположенных органов на основе
-  отечественных и зарубежных рекомендаций.
+def _prodamus_get_items(path, fields, take=200):
+    url = f"{PRODAMUS_BASE_URL}{path}"
+    headers = {
+        "Authorization": f"Bearer {PRODAMUS_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    params = {"fields": fields, "take": take}
 
+    response = requests.get(url, headers=headers, params=params, timeout=15)
+    response.raise_for_status()
+    data = response.json()
+    return (data.get("body") or {}).get("items") or []
+
+
+def fetch_courses():
+    fields = "{id,name,shortDescription,isPublished}"
+    return _prodamus_get_items("/course", fields)
+
+
+def fetch_products():
+    fields = (
+        "{id,name,description,type,isPublished,currency,price,"
+        "duration,durationType,courseId,categoryId,category{id,name},"
+        "flowDateId,flowDate{beginDate,endDate},softDeleted}"
+    )
+    return _prodamus_get_items("/product", fields)
+
+
+def build_catalog_text():
+    """
+    Собирает текстовый каталог из Prodamus:
+    - продукты с courseId группируются как тарифы соответствующего курса
+    - остальные продукты (интенсивы, чек-листы, библиотеки и т.д.) группируются
+      по их category.name
+
+    Возвращает None при ошибке запроса к API (тогда get_catalog_text() отдаст
+    последнюю успешно закэшированную версию, если она есть).
+    """
+    try:
+        courses = fetch_courses()
+        products = fetch_products()
+    except Exception as e:
+        print(f"ERROR: Failed to fetch catalog from Prodamus: {e}")
+        return None
+
+    courses_by_id = {c["id"]: c for c in courses if c.get("id")}
+    tariffs_by_course = {}
+    standalone_products = []
+
+    for p in products:
+        if p.get("softDeleted"):
+            continue
+        course_id = p.get("courseId")
+        if course_id and course_id in courses_by_id:
+            tariffs_by_course.setdefault(course_id, []).append(p)
+        else:
+            standalone_products.append(p)
+
+    lines = ["=== КУРСЫ ==="]
+
+    for course_id, course in courses_by_id.items():
+        tariffs = tariffs_by_course.get(course_id, [])
+        if not tariffs:
+            continue  # курс без ни одного тарифа/продукта - продавать нечего
+
+        status = "" if course.get("isPublished") else " [курс не опубликован]"
+        lines.append(f"\n«{course.get('name')}»{status}")
+        short_desc = _strip_html(course.get("shortDescription"))
+        if short_desc:
+            lines.append(short_desc)
+
+        for t in sorted(tariffs, key=lambda x: x.get("price") or 0):
+            availability = "" if t.get("isPublished") else " [сейчас не в продаже]"
+            price = _format_price(t)
+            duration = ""
+            if t.get("duration") and t.get("durationType"):
+                unit = "мес." if t["durationType"] == "month" else "дн."
+                duration = f", доступ {t['duration']} {unit}"
+            start = ""
+            flow_date = t.get("flowDate") or {}
+            if flow_date.get("beginDate"):
+                start = f", старт потока: {flow_date['beginDate'][:10]}"
+            lines.append(f"  - Тариф «{t.get('name')}»: {price}{duration}{start}{availability}")
+            desc = _strip_html(t.get("description"))
+            if desc:
+                lines.append(f"    {desc}")
+
+    lines.append("\n=== ИНТЕНСИВЫ И ДРУГИЕ ПРОДУКТЫ ===")
+    by_category = {}
+    for p in standalone_products:
+        cat_name = ((p.get("category") or {}).get("name")) or "Прочее"
+        by_category.setdefault(cat_name, []).append(p)
+
+    for cat_name, items in by_category.items():
+        lines.append(f"\n{cat_name}:")
+        for p in items:
+            availability = "" if p.get("isPublished") else " [сейчас не в продаже]"
+            price = _format_price(p)
+            lines.append(f"  - «{p.get('name')}»: {price}{availability}")
+            desc = _strip_html(p.get("description"))
+            if desc:
+                lines.append(f"    {desc}")
+
+    return "\n".join(lines)
+
+
+def get_catalog_text():
+    """Каталог с кэшем по TTL - Prodamus API дёргается не чаще раза в CATALOG_CACHE_TTL_SECONDS."""
+    now = time.time()
+    if _catalog_cache["text"] and (now - _catalog_cache["fetched_at"] < CATALOG_CACHE_TTL_SECONDS):
+        return _catalog_cache["text"]
+
+    fresh = build_catalog_text()
+    if fresh:
+        _catalog_cache["text"] = fresh
+        _catalog_cache["fetched_at"] = now
+        return fresh
+
+    if _catalog_cache["text"]:
+        print("WARNING: Using stale cached catalog (fresh fetch failed)")
+        return _catalog_cache["text"]
+
+    print("WARNING: No catalog available (fresh fetch failed and no cache)")
+    return "(Не удалось получить список курсов и продуктов из Prodamus. " \
+           "Не называй студенту конкретные курсы, цены или даты - предложи позвать человека.)"
+
+
+SCHOOL_INFO_OUTRO = """
 === СЕРТИФИКАТЫ ===
 - Выдаются только по итогам КУРСОВ (не выдаются за интенсивы и прочие продукты).
 - Сертификат внутреннего образца. Подойдёт для портфолио, для аккредитации использовать нельзя.
@@ -258,7 +373,6 @@ def parse_tags(raw):
         text = text[1:-1]
 
     # Разбиваем по запятой или точке с запятой
-    import re
     parts = re.split(r"[,;]", text)
     return [p.strip().strip('"').strip("'") for p in parts if p.strip()]
 
@@ -399,7 +513,101 @@ def notify_human(contact, student_id, message_text, ai_reply):
     return all_ok
 
 
-def call_qwen_api(message_text):
+ORDER_STATUS_LABELS = {
+    "created": "заказ создан, не оплачен",
+    "checkoutData": "оформление не завершено",
+    "payment": "ожидает оплаты",
+    "partiallyPaid": "оплачен частично",
+    "paid": "оплачен",
+    "preparingShipment": "оплачен",
+    "shipped": "оплачен",
+    "fulfilled": "оплачен, доступ выдан",
+    "canceled": "отменён",
+    "refund": "возврат средств",
+}
+
+# Статусы, не связанные с оформленной покупкой (заказ создан, но оплата не прошла) -
+# в блок "доступ студента" не включаем, это не доступ.
+NON_ACCESS_STATUSES = {"created", "checkoutData", "payment"}
+
+
+def fetch_student_orders(student_id):
+    """
+    POST /api/v1/purchase-order/list с фильтром по studentId - получаем заказы
+    конкретного студента: статус оплаты, дату истечения доступа (expirationDate)
+    и какой именно продукт/курс куплен (contents[].product.course).
+    """
+    url = f"{PRODAMUS_BASE_URL}/purchase-order/list"
+    headers = {
+        "Authorization": f"Bearer {PRODAMUS_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    fields = (
+        "{id,status,fullyPaid,completed,createdDate,expirationDate,"
+        "contents{id,productId,product{id,name,courseId,course{id,name}}}}"
+    )
+    payload = {
+        "filter": {"studentId": student_id, "take": 50},
+        "fields": fields
+    }
+
+    try:
+        response = requests.post(url, headers=headers, json=payload, timeout=15)
+        print(f"DEBUG: Get student orders status={response.status_code}")
+        print(f"DEBUG: Get student orders body: {response.text[:800]}")
+
+        if response.status_code == 200:
+            data = response.json()
+            return (data.get("body") or {}).get("items") or []
+        return []
+    except Exception as e:
+        print(f"ERROR: Failed to fetch student orders: {e}")
+        return []
+
+
+def build_student_access_text(student_id):
+    """
+    Формирует текст о том, что именно куплено ЭТИМ студентом и до какого числа
+    действует доступ, на основе его заказов в Prodamus. В отличие от общего
+    каталога курсов, этот блок персональный - не кэшируется, запрашивается
+    заново на каждое сообщение.
+    """
+    orders = fetch_student_orders(student_id)
+    if not orders:
+        return "У этого студента не найдено заказов в Prodamus (или не удалось их получить)."
+
+    lines = []
+    for order in orders:
+        status = order.get("status")
+        if status in NON_ACCESS_STATUSES:
+            continue
+
+        status_label = ORDER_STATUS_LABELS.get(status, status or "неизвестен")
+        expiration = order.get("expirationDate")
+        if expiration:
+            expiration_text = f", доступ до {expiration[:10]}"
+        else:
+            expiration_text = ", без даты окончания доступа (бессрочно либо не ограничен по времени)"
+
+        product_names = []
+        for c in (order.get("contents") or []):
+            product = c.get("product") or {}
+            name = product.get("name") or "неизвестный продукт"
+            course = product.get("course") or {}
+            if course.get("name"):
+                name = f"{name} (курс «{course['name']}»)"
+            product_names.append(name)
+
+        products_text = ", ".join(product_names) if product_names else "продукт не определён"
+        lines.append(f"- {products_text} — статус: {status_label}{expiration_text}")
+
+    if not lines:
+        return "У этого студента есть заказы в Prodamus, но ни один не оплачен - доступа нет."
+
+    return "\n".join(lines)
+
+
+def call_qwen_api(message_text, student_id):
     """
     Возвращает (reply_text, needs_human).
 
@@ -410,12 +618,22 @@ def call_qwen_api(message_text):
     if not QWEN_API_KEY:
         return "Ошибка: не настроен ключ нейросети.", False
 
+    student_access_text = build_student_access_text(student_id)
+
     system_prompt = (
         "Ты - помощник техподдержки онлайн-школы. Отвечай вежливо, кратко и по делу, "
         "используя факты из базы знаний ниже. Если ответа в базе знаний нет или вопрос "
         "требует действия человека (см. раздел про то, когда звать человека) - НЕ придумывай "
         "ответ, а вежливо скажи, что зовёшь специалиста.\n\n"
-        + SCHOOL_INFO +
+        + SCHOOL_INFO_INTRO + "\n"
+        + get_catalog_text() + "\n"
+        + SCHOOL_INFO_OUTRO +
+        "\n\n=== ДОСТУП ЭТОГО СТУДЕНТА (актуальные данные из Prodamus, "
+        "относятся только к текущему студенту в этом диалоге) ===\n"
+        + student_access_text +
+        "\n\nЕсли студент спрашивает про свой личный доступ, какие курсы у него куплены "
+        "или до какого числа действует доступ - отвечай на основе раздела "
+        "\"ДОСТУП ЭТОГО СТУДЕНТА\" выше, а не общего каталога курсов.\n"
         "\n\n=== ФОРМАТ ОТВЕТА ===\n"
         "Отвечай СТРОГО в формате JSON, без markdown-разметки и пояснений вокруг, вот так:\n"
         '{"reply": "текст ответа для студента", "needs_human": true или false}\n\n'
@@ -635,9 +853,9 @@ def webhook():
         print("WARNING: Message text is macro/missing")
         message_text = "Привет! Чем могу помочь?"
 
-    # 1. Получаем ответ от Qwen (с учётом общей базы знаний школы)
+    # 1. Получаем ответ от Qwen (с учётом общей базы знаний школы и заказов этого студента)
     print(f"DEBUG: Calling Qwen with: '{message_text[:80]}...'")
-    ai_response, needs_human = call_qwen_api(message_text)
+    ai_response, needs_human = call_qwen_api(message_text, student_id)
     print(f"DEBUG: AI response: '{ai_response[:80]}...' needs_human={needs_human}")
 
     # 1.5 Если нужен человек - читаем контакт через API (email/имя + база для read-merge-write),
