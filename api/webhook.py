@@ -4,6 +4,7 @@ import os
 import json
 import re
 import time
+import hmac
 from html import unescape
 
 app = Flask(__name__)
@@ -29,6 +30,12 @@ AI_PAUSED_TAG = "ai_paused"
 
 # Используется только как fallback, если chatChannelId не пришёл в вебхуке
 DEFAULT_CHAT_CHANNEL_ID = os.getenv("CHAT_CHANNEL_ID", "AVmLK7Mvd0qzLMsqzADQCA")
+
+# Секретный токен вебхука - защита от того, что кто-то, зная URL и studentId, дёргает
+# вебхук напрямую (в обход сценария Prodamus). Проверяется через query-параметр ?token=...
+# в самом URL вебхука (это надёжнее всего настроить в сценарии - URL точно поддерживается).
+# ОПЦИОНАЛЬНО: если переменная не задана - проверка выключена, ничего не ломается.
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
 # ============================================================
 # ОБЩАЯ БАЗА ЗНАНИЙ О ШКОЛЕ TIMOFEEVA-ONLINE
@@ -947,6 +954,14 @@ def webhook():
     print("NEW WEBHOOK REQUEST")
     print("=" * 60)
     print(f"DEBUG: Method={request.method}, Content-Type={request.content_type}, Content-Length={request.content_length}")
+
+    # Токен всегда читаем из query-параметра URL (?token=...), а не из тела запроса -
+    # тело содержит сообщение студента и не годится как секрет.
+    if WEBHOOK_SECRET:
+        provided_token = request.args.get("token", "")
+        if not hmac.compare_digest(provided_token, WEBHOOK_SECRET):
+            print("WARNING: Webhook request rejected - missing or invalid ?token=")
+            return jsonify({"status": "error", "message": "Unauthorized"}), 401
 
     data = {}
 
