@@ -764,6 +764,25 @@ def _split_payment_link(order):
     return f"{SPLIT_PAYMENT_CHECKOUT_URL}?orderId={order_id}&partValue={part_value}"
 
 
+CHECKOUT_URL_RE = re.compile(r"https?://\S*checkout\S*", re.IGNORECASE)
+
+
+def _sanitize_reply_payment_links(reply, allowed_links):
+    """
+    Последний рубеж защиты от того, что модель сама придумает ссылку на оплату вместо
+    честного "не знаю" - это реально случалось. Любая ссылка вида .../checkout... в
+    ответе, которая не совпадает буква в букву с одной из ссылок, которые мы САМИ
+    сгенерировали в build_student_orders_text() в этом же запросе, считается
+    непроверенной. Возвращает None, если найдена хоть одна такая ссылка (сигнал
+    вызывающему коду заменить ответ на эскалацию к человеку), иначе - исходный reply.
+    """
+    for match in CHECKOUT_URL_RE.findall(reply):
+        cleaned = match.rstrip(").,;»\"'")
+        if cleaned not in allowed_links:
+            return None
+    return reply
+
+
 def build_student_orders_text(student_id):
     """
     Формирует текст о заказах/оплате ЭТОГО студента - с дедупликацией повторных
@@ -773,11 +792,15 @@ def build_student_orders_text(student_id):
     не путать студента списком из пяти одинаковых заказов. Если оплаты не было вообще -
     показываем самый свежий черновик, чтобы можно было ответить "заказ создан, но не
     оплачен". Персональный блок, не кэшируется - запрашивается заново на каждое сообщение.
+
+    Возвращает (текст, множество РЕАЛЬНО сгенерированных ссылок на оплату) - второе
+    нужно, чтобы потом проверить, что модель не подставила в ответ ссылку, которую
+    мы сами не создавали (см. _sanitize_reply_payment_links).
     """
     orders = fetch_student_orders(student_id)
     orders = [o for o in orders if not o.get("softDeleted")]
     if not orders:
-        return "У этого студента нет заказов в Prodamus (или не удалось их получить)."
+        return "У этого студента нет заказов в Prodamus (или не удалось их получить).", set()
 
     groups = {}
     for order in orders:
@@ -788,6 +811,7 @@ def build_student_orders_text(student_id):
         return o.get("createdDate") or ""
 
     lines = []
+    valid_links = set()
     for key, group_orders in groups.items():
         paid_attempts = [o for o in group_orders if o.get("status") in ORDER_HAS_PAYMENT_STATUSES]
         if paid_attempts:
@@ -809,11 +833,14 @@ def build_student_orders_text(student_id):
         skipped_text = f" (плюс ещё {skipped} неоплаченных дублей этого же заказа, не учитываются)" if skipped > 0 else ""
 
         link = _split_payment_link(chosen)
-        link_text = f" | ссылка на оплату второй части: {link}" if link else ""
+        link_text = ""
+        if link:
+            valid_links.add(link)
+            link_text = f" | ссылка на оплату второй части: {link}"
 
         lines.append(f"- {products_text}: {status_label}, оплачено {amount_text}{skipped_text}{link_text}")
 
-    return "\n".join(lines)
+    return "\n".join(lines), valid_links
 
 
 def call_qwen_api(message_text, student_id, history=None):
@@ -832,7 +859,7 @@ def call_qwen_api(message_text, student_id, history=None):
         return "Ошибка: не настроен ключ нейросети.", False
 
     student_access_text = build_student_access_text(student_id)
-    student_orders_text = build_student_orders_text(student_id)
+    student_orders_text, valid_payment_links = build_student_orders_text(student_id)
 
     system_prompt = (
         "Ты - помощник техподдержки онлайн-школы. Отвечай вежливо, кратко и по делу, "
@@ -977,6 +1004,20 @@ def call_qwen_api(message_text, student_id, history=None):
                 else:
                     reply = "Не получилось автоматически поменять почту — сейчас передам это специалисту."
                     needs_human = True
+
+        # Модель может сама выдумать правдоподобную ссылку на оплату вместо честного
+        # "не знаю" - подтверждено на практике (сфабриковала несуществующую ссылку на
+        # оплату для студентки, у которой частичная оплата не подходила под сплит).
+        # Поэтому любую ссылку вида .../checkout... в ответе, которую мы сами не
+        # генерировали в build_student_orders_text(), вырезаем и эскалируем на человека -
+        # не отправляем студенту непроверенную ссылку на оплату.
+        sanitized_reply = _sanitize_reply_payment_links(reply, valid_payment_links)
+        if sanitized_reply is None:
+            print(f"WARNING: Blocked hallucinated/unverified payment link in reply: {reply[:300]}")
+            reply = "Не могу автоматически сформировать ссылку на оплату — сейчас передам это специалисту."
+            needs_human = True
+        else:
+            reply = sanitized_reply
 
         return reply, needs_human
 
