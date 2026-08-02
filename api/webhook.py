@@ -841,12 +841,23 @@ def webhook():
         print("WARNING: studentId is literal 'null' - looks like a test request, not a real message")
         return jsonify({"status": "ignored", "message": "Test request detected"}), 200
 
-    # Проверка паузы - сначала по тегам из САМОГО ВЕБХУКА (через #Contact.Tags# в теле
-    # запроса сценария), это та же "правда", что видна в UI. Не тратим вызов API,
-    # если тег уже виден прямо в пришедших данных.
+    # Проверка паузы: если тег ai_paused виден в теле вебхука (#Contact.Tags#), это ещё
+    # не окончательная правда - на практике подтверждено, что после снятия тега вручную
+    # в карточке контакта следующие 1-2 вебхука всё равно приходят с этим тегом в макросе
+    # (устаревший снимок на стороне Prodamus). Поэтому в этом случае дополнительно
+    # перепроверяем через живой GET /crm/lead - и снимаем паузу, если тега там уже нет.
+    # Если вебхук НЕ показывает тег - доверяем этому без лишнего вызова API (быстрый путь).
     if AI_PAUSED_TAG in tags_from_webhook:
-        print(f"DEBUG: AI is paused for this contact (tag '{AI_PAUSED_TAG}' found in webhook tags) - skipping")
-        return jsonify({"status": "ignored", "message": "AI paused for this contact"}), 200
+        contact_check = fetch_full_contact(student_id)
+        if contact_check is None:
+            # Не удалось проверить актуальное состояние - на всякий случай остаёмся
+            # молчать, чтобы не влезть в разговор, где сейчас работает человек
+            print("DEBUG: AI paused per webhook tags, live contact check failed - staying safe, skipping")
+            return jsonify({"status": "ignored", "message": "AI paused for this contact (unverified)"}), 200
+        if contact_is_ai_paused(contact_check):
+            print(f"DEBUG: AI is paused for this contact (confirmed via live contact fetch) - skipping")
+            return jsonify({"status": "ignored", "message": "AI paused for this contact"}), 200
+        print(f"DEBUG: Webhook showed stale '{AI_PAUSED_TAG}' tag, but live contact fetch shows it's removed - resuming")
 
     # Если текст - макрос или пустой
     if not message_text or "#" in str(message_text):
