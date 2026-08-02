@@ -247,6 +247,40 @@ def build_catalog_text():
     return summary + "\n" + "\n".join(lines)
 
 
+# Даты старта обучения и ОФИЦИАЛЬНОГО старта продаж по трём курсам - школа ведёт их как
+# глобальные переменные в Prodamus (Start.lap/Start.thyroid/Start.spleen,
+# Sell.lap/Sell.thyroid/Sell.spleen), которые сценарий передаёт в теле вебхука через
+# макросы {Global.Start.X}/{Global.Sell.X}. ВАЖНО: это НЕ то же самое, что "открыто ли
+# сейчас для покупки" - школа иногда открывает скрытые ранние продажи для предзаписи до
+# официальной даты (подтверждено владельцем школы). Поэтому эти даты используются только
+# для информационных ответов ("когда старт продаж/обучения"), а не для авто-переключения
+# CURRENTLY_OPEN_FOR_SALE_NAME_HINTS.
+GLOBAL_DATE_FIELDS = [
+    ("startLap", "Дифференциальная УЗД лимфаденопатий (ЛАП)", "старт обучения"),
+    ("sellLap", "Дифференциальная УЗД лимфаденопатий (ЛАП)", "официальный старт продаж"),
+    ("startThyroid", "УЗИ щитовидной железы", "старт обучения"),
+    ("sellThyroid", "УЗИ щитовидной железы", "официальный старт продаж"),
+    ("startSpleen", "Селезёнка — забытый остров", "старт обучения"),
+    ("sellSpleen", "Селезёнка — забытый остров", "официальный старт продаж"),
+]
+
+
+def build_global_dates_text(data):
+    """
+    Читает даты из полей тела вебхука (см. GLOBAL_DATE_FIELDS) и форматирует в текст.
+    Значения - произвольный текст ("8 сентября 2026г", "Скоро..."), не строгие даты.
+    Пропускает поля, если макрос не резолвился (например, тестовый запрос из редактора
+    сценария Prodamus, где вместо значения приходит буквальный текст макроса).
+    """
+    lines = []
+    for field, course_label, kind_label in GLOBAL_DATE_FIELDS:
+        value = data.get(field)
+        if not value or "#" in str(value) or "{" in str(value):
+            continue
+        lines.append(f"- «{course_label}»: {kind_label} — {value}")
+    return "\n".join(lines)
+
+
 def get_catalog_text():
     """Каталог с кэшем по TTL - Prodamus API дёргается не чаще раза в CATALOG_CACHE_TTL_SECONDS."""
     now = time.time()
@@ -882,13 +916,16 @@ def build_student_orders_text(student_id):
     return "\n".join(lines), valid_links
 
 
-def call_qwen_api(message_text, student_id, history=None):
+def call_qwen_api(message_text, student_id, history=None, global_dates_text=""):
     """
     Возвращает (reply_text, needs_human).
 
     history - список предыдущих сообщений диалога [{"role": "user"/"assistant", "content": "..."}]
     в хронологическом порядке (без текущего сообщения) - даёт модели минимальную память
     о разговоре, а не только о последнем сообщении студента.
+
+    global_dates_text - даты старта обучения/официального старта продаж из глобальных
+    переменных Prodamus, см. build_global_dates_text().
 
     Просим Qwen отвечать строго в формате JSON, чтобы явно понимать,
     нужно ли звать человека, без хрупкого поиска ключевых слов в тексте.
@@ -968,6 +1005,19 @@ def call_qwen_api(message_text, student_id, history=None):
         "ДОСТУП ниже) - это отдельный вопрос и НЕ означает, что курс сейчас открыт для новых "
         "покупок."
     )
+
+    if global_dates_text:
+        catalog_reminder += (
+            "\n\n=== ДАТЫ СТАРТА ОБУЧЕНИЯ И ОФИЦИАЛЬНОГО СТАРТА ПРОДАЖ (из Prodamus) ===\n"
+            + global_dates_text +
+            "\n\nЭто ТОЧНЫЕ даты, используй их вместо расплывчатых формулировок вида "
+            "\"примерно за месяц\", если студент спрашивает про конкретный из этих трёх "
+            "курсов. ВАЖНО: официальная дата старта продаж - не то же самое, что \"открыто "
+            "ли сейчас купить\" (см. пометки выше) - иногда продажи открываются раньше "
+            "официальной даты для узкого круга (например, для тех, кто в предзаписи), "
+            "поэтому не утверждай, что курс точно закрыт до этой даты, если пометка "
+            "\"[сейчас не в открытой продаже]\" у него отсутствует."
+        )
 
     access_reminder = (
         "=== ДОСТУП ЭТОГО СТУДЕНТА ПРЯМО СЕЙЧАС (запрошено из Prodamus для ЭТОГО "
@@ -1281,6 +1331,7 @@ def webhook():
         or DEFAULT_CHAT_CHANNEL_ID
     )
     tags_from_webhook = parse_tags(data.get("tags") or data.get("Tags"))
+    global_dates_text = build_global_dates_text(data)
 
     print(f"DEBUG: Parsed:")
     print(f"  student_id:       {student_id}")
@@ -1352,7 +1403,7 @@ def webhook():
     # 1. Получаем ответ от Qwen (с учётом общей базы знаний школы, доступа этого студента
     # и истории последних сообщений диалога)
     print(f"DEBUG: Calling Qwen with: '{message_text[:80]}...'")
-    ai_response, needs_human = call_qwen_api(message_text, student_id, conversation_history)
+    ai_response, needs_human = call_qwen_api(message_text, student_id, conversation_history, global_dates_text)
     print(f"DEBUG: AI response: '{ai_response[:80]}...' needs_human={needs_human}")
 
     # 1.5 Если нужен человек - читаем контакт через API (email/имя + база для read-merge-write),
