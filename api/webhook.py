@@ -599,9 +599,13 @@ def build_student_access_text(student_id):
     return "\n".join(lines)
 
 
-def call_qwen_api(message_text, student_id):
+def call_qwen_api(message_text, student_id, history=None):
     """
     Возвращает (reply_text, needs_human).
+
+    history - список предыдущих сообщений диалога [{"role": "user"/"assistant", "content": "..."}]
+    в хронологическом порядке (без текущего сообщения) - даёт модели минимальную память
+    о разговоре, а не только о последнем сообщении студента.
 
     Просим Qwen отвечать строго в формате JSON, чтобы явно понимать,
     нужно ли звать человека, без хрупкого поиска ключевых слов в тексте.
@@ -636,10 +640,11 @@ def call_qwen_api(message_text, student_id):
 
     payload = {
         "model": "qwen-plus",
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": message_text}
-        ]
+        "messages": (
+            [{"role": "system", "content": system_prompt}]
+            + (history or [])
+            + [{"role": "user", "content": message_text}]
+        )
     }
 
     try:
@@ -677,8 +682,16 @@ def call_qwen_api(message_text, student_id):
         return "Извините, сейчас я не могу ответить. Попробуйте позже.", True
 
 
-def get_conversation_id(chat_channel_id, student_id):
-    """Получаем conversationId через API Prodamus.
+CONVERSATION_HISTORY_MESSAGE_COUNT = int(os.getenv("CONVERSATION_HISTORY_MESSAGE_COUNT", "5"))
+
+# Берём с запасом больше, чем нужно для истории: самый свежий элемент - это, как правило,
+# само текущее сообщение (Prodamus уже записывает его до вызова вебхука) - его исключаем,
+# плюс попадаются пустые/служебные сообщения (например, приветствие сценария).
+CONVERSATION_HISTORY_FETCH_COUNT = CONVERSATION_HISTORY_MESSAGE_COUNT + 5
+
+
+def fetch_recent_channel_messages(chat_channel_id, student_id, take):
+    """Последние сообщения канала чата через API Prodamus.
 
     Реальная структура ответа:
     {
@@ -690,7 +703,7 @@ def get_conversation_id(chat_channel_id, student_id):
             "id": "...",
             "conversationId": "...",
             "text": "...",
-            "user": {"contact": {"id": "...", ...}},
+            "user": {"contact": {"id": "...", ...}, "isSystem": bool},
             ...
           },
           ...
@@ -699,15 +712,19 @@ def get_conversation_id(chat_channel_id, student_id):
       "resetToken": false
     }
 
-    conversationId лежит внутри каждого элемента body.items - берём первый элемент,
-    у которого он есть (по возможности - совпадающий по studentId).
+    Элементы идут от НОВЫХ к СТАРЫМ. Сообщения от студента - это те, у которых
+    user.contact.id совпадает со studentId; ответы бота/сценария приходят
+    с user.isSystem=true и contact=null.
+
+    Используется и для определения conversationId, и для построения истории диалога -
+    один вызов API на оба назначения.
     """
 
     url = f"{PRODAMUS_BASE_URL}/chat-channel/messages/recent"
     params = {
         "chatChannelId": chat_channel_id,
         "studentId": student_id,
-        "take": 5
+        "take": take
     }
 
     headers = {
@@ -722,28 +739,62 @@ def get_conversation_id(chat_channel_id, student_id):
 
         if response.status_code == 200:
             data = response.json()
-            items = (data.get("body") or {}).get("items") or []
-
-            # Сначала пробуем найти сообщение именно от нужного студента
-            for item in items:
-                contact = (item.get("user") or {}).get("contact") or {}
-                if contact.get("id") == student_id and item.get("conversationId"):
-                    conv_id = item["conversationId"]
-                    print(f"DEBUG: Found conversationId (matched student)={conv_id}")
-                    return conv_id
-
-            # Если не нашли точное совпадение - берём первый попавшийся conversationId
-            for item in items:
-                if item.get("conversationId"):
-                    conv_id = item["conversationId"]
-                    print(f"DEBUG: Found conversationId (first available)={conv_id}")
-                    return conv_id
-
-        print("DEBUG: No conversation found via API")
-        return None
+            return (data.get("body") or {}).get("items") or []
+        return []
     except Exception as e:
-        print(f"ERROR: Failed to get conversation from API: {e}")
-        return None
+        print(f"ERROR: Failed to get recent messages from API: {e}")
+        return []
+
+
+def extract_conversation_id(items, student_id):
+    """conversationId лежит внутри каждого элемента - берём первый, у которого он есть
+    (по возможности - совпадающий по studentId)."""
+
+    for item in items:
+        contact = (item.get("user") or {}).get("contact") or {}
+        if contact.get("id") == student_id and item.get("conversationId"):
+            conv_id = item["conversationId"]
+            print(f"DEBUG: Found conversationId (matched student)={conv_id}")
+            return conv_id
+
+    for item in items:
+        if item.get("conversationId"):
+            conv_id = item["conversationId"]
+            print(f"DEBUG: Found conversationId (first available)={conv_id}")
+            return conv_id
+
+    print("DEBUG: No conversation found via API")
+    return None
+
+
+def build_conversation_history(items, student_id, current_message_text, max_messages):
+    """
+    Превращает последние сообщения канала в список [{"role", "content"}] для Qwen -
+    минимальная память бота о разговоре (последние max_messages сообщений).
+
+    items идут от новых к старым - разворачиваем в хронологический порядок.
+    Текущее входящее сообщение (оно и так передаётся отдельным user-сообщением)
+    исключаем, чтобы не дублировать его в истории.
+    """
+
+    history = []
+    for item in items:
+        text = (item.get("text") or "").strip()
+        if not text:
+            continue
+        contact = (item.get("user") or {}).get("contact") or {}
+        role = "user" if contact.get("id") == student_id else "assistant"
+        history.append({"role": role, "content": text})
+
+    history.reverse()
+
+    if history and history[-1]["role"] == "user" and history[-1]["content"] == current_message_text:
+        history.pop()
+
+    if max_messages:
+        history = history[-max_messages:]
+
+    return history
 
 
 def send_prodamus_message(chat_channel_id, student_id, text, conversation_id=None):
@@ -856,9 +907,20 @@ def webhook():
         print("WARNING: Message text is macro/missing")
         message_text = "Привет! Чем могу помочь?"
 
-    # 1. Получаем ответ от Qwen (с учётом общей базы знаний школы и заказов этого студента)
+    # 0. Одним запросом получаем последние сообщения канала - используем их и для истории
+    # диалога (минимальная память бота), и ниже для определения conversationId.
+    recent_items = fetch_recent_channel_messages(
+        chat_channel_id, student_id, take=CONVERSATION_HISTORY_FETCH_COUNT
+    )
+    conversation_history = build_conversation_history(
+        recent_items, student_id, message_text, CONVERSATION_HISTORY_MESSAGE_COUNT
+    )
+    print(f"DEBUG: Conversation history ({len(conversation_history)} messages): {conversation_history}")
+
+    # 1. Получаем ответ от Qwen (с учётом общей базы знаний школы, доступа этого студента
+    # и истории последних сообщений диалога)
     print(f"DEBUG: Calling Qwen with: '{message_text[:80]}...'")
-    ai_response, needs_human = call_qwen_api(message_text, student_id)
+    ai_response, needs_human = call_qwen_api(message_text, student_id, conversation_history)
     print(f"DEBUG: AI response: '{ai_response[:80]}...' needs_human={needs_human}")
 
     # 1.5 Если нужен человек - читаем контакт через API (email/имя + база для read-merge-write),
@@ -869,12 +931,12 @@ def webhook():
         add_ai_paused_tag(contact, known_current_tags=tags_from_webhook)
         notify_human(contact, student_id, message_text, ai_response)
 
-    # 2. Получаем conversationId через API если нет из вебхука
+    # 2. Получаем conversationId - из вебхука, а если там макрос/пусто, то из уже
+    # полученных recent_items (без повторного вызова API)
     conversation_id = conversation_id_from_webhook
 
     if not conversation_id or "#" in str(conversation_id):
-        print("DEBUG: Getting conversationId via API...")
-        conversation_id = get_conversation_id(chat_channel_id, student_id)
+        conversation_id = extract_conversation_id(recent_items, student_id)
 
     print(f"DEBUG: Final conversation_id: {conversation_id}")
 
