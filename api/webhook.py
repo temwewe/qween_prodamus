@@ -650,6 +650,133 @@ def build_student_access_text(student_id):
     return "\n".join(lines)
 
 
+ORDER_STATUS_LABELS = {
+    "created": "заказ создан, оплата не начата",
+    "checkoutData": "оформление не завершено",
+    "payment": "ожидает подтверждения оплаты",
+    "partiallyPaid": "оплачен частично",
+    "paid": "оплачен полностью",
+    "preparingShipment": "оплачен",
+    "shipped": "оплачен",
+    "fulfilled": "оплачен, доступ выдан",
+    "canceled": "отменён",
+    "refund": "оформлен возврат",
+}
+
+# Заказы без единой попытки оплаты - это и есть тот самый "шум" от повторных кликов
+# "купить": студент часто создаёт несколько заказов на один и тот же курс, а платит
+# только по одному, остальные так и остаются нетронутыми черновиками.
+ORDERS_WITHOUT_PAYMENT_ATTEMPT_STATUSES = {"created", "checkoutData"}
+
+# Заказы в этих статусах считаем "с реальной оплатой" - именно такой заказ на продукт
+# нужно показывать студенту, если он есть, вместо всех остальных дублей-черновиков.
+ORDER_HAS_PAYMENT_STATUSES = {
+    "payment", "partiallyPaid", "paid", "preparingShipment", "shipped", "fulfilled", "refund"
+}
+
+
+def fetch_student_orders(student_id):
+    """
+    POST /api/v1/purchase-order/list с фильтром по studentId - заказы студента со
+    статусом оплаты. ВАЖНО: студенты часто создают по несколько заказов на один и тот
+    же курс/продукт (повторные попытки оформить заказ), а оплачивают только один -
+    остальные так и остаются висеть неоплаченными черновиками. Дедупликация от этого
+    шума происходит в build_student_orders_text(), здесь просто сырые данные.
+    """
+    fields = (
+        "{id,status,fullyPaid,partiallyPaid,completed,createdDate,expirationDate,"
+        "totalAmount,paidAmount,currency,"
+        "payments{id,status,amount,paymentDate,isSuccess,isFail,installmentStatus},"
+        "contents{id,productId,product{id,name,courseId,course{id,name}}}}"
+    )
+    url = f"{PRODAMUS_BASE_URL}/purchase-order/list"
+    headers = {
+        "Authorization": f"Bearer {PRODAMUS_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {"filter": {"studentId": student_id, "take": 100}, "fields": fields}
+
+    try:
+        response = requests.post(url, headers=headers, json=payload, timeout=15)
+        print(f"DEBUG: Get student orders status={response.status_code}")
+        print(f"DEBUG: Get student orders body: {response.text[:800]}")
+
+        if response.status_code == 200:
+            data = response.json()
+            return (data.get("body") or {}).get("items") or []
+        return []
+    except Exception as e:
+        print(f"ERROR: Failed to fetch student orders: {e}")
+        return []
+
+
+def _order_product_names(order):
+    names = []
+    for c in (order.get("contents") or []):
+        product = c.get("product") or {}
+        name = product.get("name") or "неизвестный продукт"
+        course = (product.get("course") or {})
+        if course.get("name"):
+            name = f"{name} (курс «{course['name']}»)"
+        names.append(name)
+    return names
+
+
+def _order_product_key(order):
+    """Ключ группировки дублей - набор товаров в заказе, а не id самого заказа."""
+    ids = tuple(sorted(c.get("productId") or "" for c in (order.get("contents") or [])))
+    return ids or (order.get("id"),)
+
+
+def build_student_orders_text(student_id):
+    """
+    Формирует текст о заказах/оплате ЭТОГО студента - с дедупликацией повторных
+    неоплаченных попыток. Для каждого набора товаров (курс/продукт) показываем ОДИН
+    заказ: если среди дублей есть хоть один с реальной попыткой оплаты - показываем
+    его (самый свежий из таких), остальные черновики без оплаты молча скрываем, чтобы
+    не путать студента списком из пяти одинаковых заказов. Если оплаты не было вообще -
+    показываем самый свежий черновик, чтобы можно было ответить "заказ создан, но не
+    оплачен". Персональный блок, не кэшируется - запрашивается заново на каждое сообщение.
+    """
+    orders = fetch_student_orders(student_id)
+    orders = [o for o in orders if not o.get("softDeleted")]
+    if not orders:
+        return "У этого студента нет заказов в Prodamus (или не удалось их получить)."
+
+    groups = {}
+    for order in orders:
+        key = _order_product_key(order)
+        groups.setdefault(key, []).append(order)
+
+    def sort_key(o):
+        return o.get("createdDate") or ""
+
+    lines = []
+    for key, group_orders in groups.items():
+        paid_attempts = [o for o in group_orders if o.get("status") in ORDER_HAS_PAYMENT_STATUSES]
+        if paid_attempts:
+            chosen = max(paid_attempts, key=sort_key)
+        else:
+            chosen = max(group_orders, key=sort_key)
+
+        status_label = ORDER_STATUS_LABELS.get(chosen.get("status"), chosen.get("status") or "неизвестен")
+        product_names = _order_product_names(chosen)
+        products_text = ", ".join(product_names) if product_names else "товар не определён"
+
+        currency = (chosen.get("currency") or "rub").lower()
+        symbol = CURRENCY_SYMBOLS.get(currency, currency.upper())
+        paid_amount = chosen.get("paidAmount") or 0
+        total_amount = chosen.get("totalAmount") or 0
+        amount_text = f"{paid_amount:,.0f} из {total_amount:,.0f} {symbol}".replace(",", " ")
+
+        skipped = len(group_orders) - 1
+        skipped_text = f" (плюс ещё {skipped} неоплаченных дублей этого же заказа, не учитываются)" if skipped > 0 else ""
+
+        lines.append(f"- {products_text}: {status_label}, оплачено {amount_text}{skipped_text}")
+
+    return "\n".join(lines)
+
+
 def call_qwen_api(message_text, student_id, history=None):
     """
     Возвращает (reply_text, needs_human).
@@ -666,6 +793,7 @@ def call_qwen_api(message_text, student_id, history=None):
         return "Ошибка: не настроен ключ нейросети.", False
 
     student_access_text = build_student_access_text(student_id)
+    student_orders_text = build_student_orders_text(student_id)
 
     system_prompt = (
         "Ты - помощник техподдержки онлайн-школы. Отвечай вежливо, кратко и по делу, "
@@ -679,6 +807,15 @@ def call_qwen_api(message_text, student_id, history=None):
         "или до какого числа действует доступ - в конце этого сообщения (после истории "
         "переписки) будет отдельный блок \"ДОСТУП ЭТОГО СТУДЕНТА ПРЯМО СЕЙЧАС\" - отвечай "
         "строго по нему, а не по общему каталогу курсов и не по истории переписки.\n"
+        "\n\n=== СТАТУС ЗАКАЗОВ И ОПЛАТЫ ===\n"
+        "Если студент спрашивает про статус своего заказа/оплаты, сколько уже оплачено "
+        "или прошла ли оплата - в конце этого сообщения будет блок \"ЗАКАЗЫ И ОПЛАТА ЭТОГО "
+        "СТУДЕНТА ПРЯМО СЕЙЧАС\" - отвечай по нему. Студенты часто создают несколько заказов "
+        "на один и тот же курс, а оплачивают только один - в этом блоке уже отфильтрованы "
+        "неоплаченные дубли, показан только реальный (оплаченный, если есть) заказ на каждый "
+        "курс/продукт, так что можешь доверять списку как есть, не пересчитывай сам. "
+        "Саму ссылку на оплату оставшейся части бот не формирует (см. правило про рассрочку "
+        "в разделе \"когда звать человека\") - здесь можно только сообщить статус/сумму.\n"
         "\n\n=== СМЕНА EMAIL ===\n"
         "Если студент просит исправить/поменять свою почту (например, ошибся при оформлении "
         "заказа) И явно написал новый адрес полностью (вида имя@домен.зона) - положи этот "
@@ -716,8 +853,18 @@ def call_qwen_api(message_text, student_id, history=None):
         "ПРАВ ЭТОТ БЛОК, а не история. Отвечай студенту, используя именно эти данные."
     )
 
+    orders_reminder = (
+        "=== ЗАКАЗЫ И ОПЛАТА ЭТОГО СТУДЕНТА ПРЯМО СЕЙЧАС (запрошено из Prodamus для "
+        "ЭТОГО сообщения, самые свежие данные, дубли-черновики без оплаты уже убраны) ===\n"
+        + student_orders_text +
+        "\n\nЭто АКТУАЛЬНОЕ состояние заказов на данный момент, оно может отличаться от "
+        "того, что говорилось раньше в этом диалоге - если противоречит истории переписки "
+        "выше, ПРАВ ЭТОТ БЛОК, а не история."
+    )
+
     user_message_with_context = (
-        access_reminder + "\n\n=== СООБЩЕНИЕ СТУДЕНТА ===\n" + message_text
+        access_reminder + "\n\n" + orders_reminder +
+        "\n\n=== СООБЩЕНИЕ СТУДЕНТА ===\n" + message_text
     )
 
     payload = {
