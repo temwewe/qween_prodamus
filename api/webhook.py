@@ -513,96 +513,88 @@ def notify_human(contact, student_id, message_text, ai_reply):
     return all_ok
 
 
-ORDER_STATUS_LABELS = {
-    "created": "заказ создан, не оплачен",
-    "checkoutData": "оформление не завершено",
-    "payment": "ожидает оплаты",
-    "partiallyPaid": "оплачен частично",
-    "paid": "оплачен",
-    "preparingShipment": "оплачен",
-    "shipped": "оплачен",
-    "fulfilled": "оплачен, доступ выдан",
-    "canceled": "отменён",
-    "refund": "возврат средств",
+LICENSE_STATE_LABELS = {
+    "active": "включён",
+    "paused": "приостановлен администратором",
 }
 
-# Статусы, не связанные с оформленной покупкой (заказ создан, но оплата не прошла) -
-# в блок "доступ студента" не включаем, это не доступ.
-NON_ACCESS_STATUSES = {"created", "checkoutData", "payment"}
+LICENSE_RELEVANCE_LABELS = {
+    "past": "период доступа уже закончился",
+    "present": "доступ действует прямо сейчас",
+    "future": "доступ ещё не начался (начнётся позже)",
+}
 
 
-def fetch_student_orders(student_id):
+def fetch_student_course_accesses(student_id):
     """
-    POST /api/v1/purchase-order/list с фильтром по studentId - получаем заказы
-    конкретного студента: статус оплаты, дату истечения доступа (expirationDate)
-    и какой именно продукт/курс куплен (contents[].product.course).
+    Реальный доступ студента к курсам/продуктам в Prodamus - это отдельная сущность
+    (StudentLicense = "лицензия"), а НЕ производная от статуса оплаты заказа: оплаченный
+    заказ не всегда означает активный доступ прямо сейчас - доступ может быть вручную
+    приостановлен (state=paused) или его период ещё не начался/уже закончился
+    (relevance=future/past) независимо от оплаты. Отдельного REST-пути для лицензий
+    в API нет, но их можно прочитать как вложенное поле контакта.
+
+    GET /api/v1/crm/lead/{id}?fields={studentCourseAccesses{...}}
     """
-    url = f"{PRODAMUS_BASE_URL}/purchase-order/list"
+    fields = (
+        "{id,studentCourseAccesses{id,type,state,relevance,beginDate,endDate,"
+        "courseId,course{id,name},coursePlanId,coursePlan{id,name},"
+        "productId,product{id,name}}}"
+    )
+    url = f"{PRODAMUS_BASE_URL}/crm/lead/{student_id}"
     headers = {
         "Authorization": f"Bearer {PRODAMUS_API_KEY}",
         "Content-Type": "application/json"
     }
-    fields = (
-        "{id,status,fullyPaid,completed,createdDate,expirationDate,"
-        "contents{id,productId,product{id,name,courseId,course{id,name}}}}"
-    )
-    payload = {
-        "filter": {"studentId": student_id, "take": 50},
-        "fields": fields
-    }
+    params = {"fields": fields}
 
     try:
-        response = requests.post(url, headers=headers, json=payload, timeout=15)
-        print(f"DEBUG: Get student orders status={response.status_code}")
-        print(f"DEBUG: Get student orders body: {response.text[:800]}")
+        response = requests.get(url, headers=headers, params=params, timeout=15)
+        print(f"DEBUG: Get student course accesses status={response.status_code}")
+        print(f"DEBUG: Get student course accesses body: {response.text[:800]}")
 
         if response.status_code == 200:
             data = response.json()
-            return (data.get("body") or {}).get("items") or []
+            body = data.get("body") or {}
+            return body.get("studentCourseAccesses") or []
         return []
     except Exception as e:
-        print(f"ERROR: Failed to fetch student orders: {e}")
+        print(f"ERROR: Failed to fetch student course accesses: {e}")
         return []
 
 
 def build_student_access_text(student_id):
     """
-    Формирует текст о том, что именно куплено ЭТИМ студентом и до какого числа
-    действует доступ, на основе его заказов в Prodamus. В отличие от общего
-    каталога курсов, этот блок персональный - не кэшируется, запрашивается
-    заново на каждое сообщение.
+    Формирует текст о РЕАЛЬНОМ доступе ЭТОГО студента к курсам/продуктам на основе его
+    лицензий (StudentLicense), а не статуса оплаты заказов. Персональный блок, поэтому
+    не кэшируется (в отличие от общего каталога) - запрашивается заново на каждое сообщение.
     """
-    orders = fetch_student_orders(student_id)
-    if not orders:
-        return "У этого студента не найдено заказов в Prodamus (или не удалось их получить)."
+    accesses = fetch_student_course_accesses(student_id)
+    if not accesses:
+        return "У этого студента нет ни одной лицензии доступа в Prodamus (или не удалось их получить)."
 
     lines = []
-    for order in orders:
-        status = order.get("status")
-        if status in NON_ACCESS_STATUSES:
-            continue
+    for lic in accesses:
+        course = lic.get("course") or {}
+        product = lic.get("product") or {}
+        course_plan = lic.get("coursePlan") or {}
 
-        status_label = ORDER_STATUS_LABELS.get(status, status or "неизвестен")
-        expiration = order.get("expirationDate")
-        if expiration:
-            expiration_text = f", доступ до {expiration[:10]}"
+        if course.get("name"):
+            name = f"курс «{course['name']}»"
+            if course_plan.get("name"):
+                name += f", тариф «{course_plan['name']}»"
+        elif product.get("name"):
+            name = f"продукт «{product['name']}»"
         else:
-            expiration_text = ", без даты окончания доступа (бессрочно либо не ограничен по времени)"
+            name = "неизвестный курс/продукт"
 
-        product_names = []
-        for c in (order.get("contents") or []):
-            product = c.get("product") or {}
-            name = product.get("name") or "неизвестный продукт"
-            course = product.get("course") or {}
-            if course.get("name"):
-                name = f"{name} (курс «{course['name']}»)"
-            product_names.append(name)
+        state_label = LICENSE_STATE_LABELS.get(lic.get("state"), lic.get("state") or "неизвестно")
+        relevance_label = LICENSE_RELEVANCE_LABELS.get(lic.get("relevance"), lic.get("relevance") or "")
 
-        products_text = ", ".join(product_names) if product_names else "продукт не определён"
-        lines.append(f"- {products_text} — статус: {status_label}{expiration_text}")
+        end_date = lic.get("endDate")
+        end_text = f", доступ до {end_date[:10]}" if end_date else ", без даты окончания (бессрочно)"
 
-    if not lines:
-        return "У этого студента есть заказы в Prodamus, но ни один не оплачен - доступа нет."
+        lines.append(f"- {name} — доступ {state_label}, {relevance_label}{end_text}")
 
     return "\n".join(lines)
 
