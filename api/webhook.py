@@ -130,6 +130,26 @@ def fetch_products():
     return _prodamus_get_items("/product", fields)
 
 
+# В Prodamus нет отдельного признака "сейчас идёт активная продажа" - isPublished
+# означает лишь "видно на сайте", это подтверждено владельцем школы: некоторые курсы
+# помечены как isPublished, но на деле сейчас не продаются (открытие/закрытие продаж -
+# ручное маркетинговое решение, не связанное с этим флагом). Поэтому здесь ведётся
+# отдельный список того, что РЕАЛЬНО сейчас в открытой продаже - правьте вручную при
+# открытии/закрытии продаж. Сверка - по вхождению строки в название курса/продукта
+# (регистронезависимо), поэтому формулировки могут быть неполными/приблизительными.
+CURRENTLY_OPEN_FOR_SALE_NAME_HINTS = [
+    "щитовид",             # УЗИ щитовидной железы: от нормы до патологии
+    "ultrasound friends",  # Подписка на Telegram-канал ULTRASOUND FRIENDS
+    "уровни лимфоузлов",   # Интенсив "Уровни лимфоузлов шеи"
+    "имплант",             # Чек-лист по описанию грудных имплантатов
+]
+
+
+def _is_currently_open_for_sale(name):
+    name_lower = (name or "").lower()
+    return any(hint in name_lower for hint in CURRENTLY_OPEN_FOR_SALE_NAME_HINTS)
+
+
 def build_catalog_text():
     """
     Собирает текстовый каталог из Prodamus:
@@ -174,7 +194,8 @@ def build_catalog_text():
             lines.append(short_desc)
 
         for t in sorted(tariffs, key=lambda x: x.get("price") or 0):
-            availability = "" if t.get("isPublished") else " [сейчас не в продаже]"
+            is_open = _is_currently_open_for_sale(course.get("name")) or _is_currently_open_for_sale(t.get("name"))
+            availability = "" if is_open else " [сейчас не в открытой продаже]"
             price = _format_price(t)
             duration = ""
             if t.get("duration") and t.get("durationType"):
@@ -198,7 +219,7 @@ def build_catalog_text():
     for cat_name, items in by_category.items():
         lines.append(f"\n{cat_name}:")
         for p in items:
-            availability = "" if p.get("isPublished") else " [сейчас не в продаже]"
+            availability = "" if _is_currently_open_for_sale(p.get("name")) else " [сейчас не в открытой продаже]"
             price = _format_price(p)
             lines.append(f"  - «{p.get('name')}»: {price}{availability}")
             desc = _strip_html(p.get("description"))
@@ -869,6 +890,13 @@ def call_qwen_api(message_text, student_id, history=None):
         + SCHOOL_INFO_INTRO + "\n"
         + get_catalog_text() + "\n"
         + SCHOOL_INFO_OUTRO +
+        "\n\nВАЖНО про каталог выше: пометка \"[сейчас не в открытой продаже]\" у тарифа/"
+        "продукта означает, что его НЕЛЬЗЯ купить прямо сейчас, даже если у него есть цена "
+        "и описание. Если студент спрашивает \"что сейчас в продаже\" или можно ли купить "
+        "конкретный курс - НЕ перечисляй и не подтверждай доступность курсов/тарифов с этой "
+        "пометкой, только те, у которых её нет. Для курсов с пометкой - предложи лист "
+        "ожидания или подписку на Telegram/Max-группу школы (см. раздел о том, что делать, "
+        "если курс не в продаже).\n"
         "\n\nЕсли студент спрашивает про свой личный доступ, какие курсы у него куплены "
         "или до какого числа действует доступ - в конце этого сообщения (после истории "
         "переписки) будет отдельный блок \"ДОСТУП ЭТОГО СТУДЕНТА ПРЯМО СЕЙЧАС\" - отвечай "
