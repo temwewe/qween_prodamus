@@ -307,8 +307,8 @@ SCHOOL_INFO_OUTRO = """
    на скачивание.
 
 В: Указал(а) неправильную почту при оформлении заказа, как исправить?
-О: Позвать человека для решения проблемы, а пока попросить студента прислать правильную/
-   действующую почту.
+О: Попросить студента прислать полностью новый правильный email - его можно сменить прямо
+   в этом чате (см. раздел "СМЕНА EMAIL"), звать человека для этого не нужно.
 
 В: Нужен ли доступ к УЗИ-аппарату, чтобы проходить обучение?
 О: Не обязательно, но желательно — так легче отрабатывать практические навыки.
@@ -343,7 +343,8 @@ SCHOOL_INFO_OUTRO = """
 === КОГДА ОБЯЗАТЕЛЬНО ЗВАТЬ ЧЕЛОВЕКА (не пытаться решить самостоятельно) ===
 - Проблемы с доступом к курсу/оплатой, которые не решаются проверкой почты и данных входа
 - Запрос ссылки на оплату оставшейся части (рассрочка/сплит)
-- Ошибка в данных сертификата или в email при оформлении заказа
+- Ошибка в данных уже выпущенного сертификата (например, неверные ФИО) - смена email НЕ
+  входит сюда, её можно сделать прямо в чате, см. раздел "СМЕНА EMAIL"
 - Возврат денег
 - Смена тарифа или курса
 - Продление доступа, если он уже закончился
@@ -461,29 +462,12 @@ def add_ai_paused_tag(contact, known_current_tags=None):
         return False
 
 
-def notify_human(contact, student_id, message_text, ai_reply):
-    """Отправляем уведомление всем настроенным админам в Telegram, что нужен человек"""
+def send_telegram_notification(text):
+    """Отправляем текст всем настроенным админам в Telegram."""
 
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_IDS:
         print("WARNING: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_IDS not configured, skipping notification")
         return False
-
-    contact = contact or {}
-    full_name = " ".join(
-        part for part in [contact.get("firstName"), contact.get("lastName")] if part
-    ) or "неизвестно"
-    email = contact.get("email") or "неизвестно"
-
-    text = (
-        "🔔 Нужен человек в чате поддержки\n\n"
-        f"Студент: {full_name}\n"
-        f"Email: {email}\n"
-        f"ID студента: {student_id}\n\n"
-        f"Сообщение студента: {message_text}\n\n"
-        f"Ответ бота студенту: {ai_reply}\n\n"
-        f"⚠️ Бот поставлен на паузу для этого контакта (тег \"{AI_PAUSED_TAG}\"). "
-        "Снимите тег в карточке контакта в Prodamus, когда закончите общение."
-    )
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     all_ok = True
@@ -504,6 +488,73 @@ def notify_human(contact, student_id, message_text, ai_reply):
             all_ok = False
 
     return all_ok
+
+
+def notify_human(contact, student_id, message_text, ai_reply):
+    """Уведомляем админов, что нужен человек"""
+
+    contact = contact or {}
+    full_name = " ".join(
+        part for part in [contact.get("firstName"), contact.get("lastName")] if part
+    ) or "неизвестно"
+    email = contact.get("email") or "неизвестно"
+
+    text = (
+        "🔔 Нужен человек в чате поддержки\n\n"
+        f"Студент: {full_name}\n"
+        f"Email: {email}\n"
+        f"ID студента: {student_id}\n\n"
+        f"Сообщение студента: {message_text}\n\n"
+        f"Ответ бота студенту: {ai_reply}\n\n"
+        f"⚠️ Бот поставлен на паузу для этого контакта (тег \"{AI_PAUSED_TAG}\"). "
+        "Снимите тег в карточке контакта в Prodamus, когда закончите общение."
+    )
+    return send_telegram_notification(text)
+
+
+EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+
+
+def update_student_email(student_id, new_email):
+    """
+    Меняем email студента по его просьбе (например, ошибся при оформлении заказа) -
+    это тот же email, на который приходит доступ и под которым он логинится в личный
+    кабинет школы. Читаем контакт целиком и отправляем обратно с обновлённым email
+    (read-merge-write), чтобы не потерять остальные поля - тот же паттерн, что и в
+    add_ai_paused_tag.
+
+    Возвращает (success: bool, contact: dict | None, old_email: str | None).
+    """
+    contact = fetch_full_contact(student_id)
+    if contact is None:
+        return False, None, None
+
+    old_email = contact.get("email")
+
+    updated_contact = dict(contact)
+    updated_contact["email"] = new_email
+
+    # Эта модель API использует Optional<T> для полей-коллекций - сервер требует
+    # обёртку {"value": [...]}, а не голый JSON-массив (иначе 400 invalidModel).
+    if "tags" in updated_contact:
+        updated_contact["tags"] = {"value": updated_contact.get("tags") or []}
+    if "groups" in updated_contact:
+        updated_contact["groups"] = {"value": updated_contact.get("groups") or []}
+
+    url = f"{PRODAMUS_BASE_URL}/crm/lead"
+    headers = {
+        "Authorization": f"Bearer {PRODAMUS_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    try:
+        response = requests.put(url, headers=headers, json=updated_contact, timeout=10)
+        print(f"DEBUG: Update contact (change email) status={response.status_code}")
+        print(f"DEBUG: Update contact body: {response.text[:500]}")
+        return response.status_code == 200, contact, old_email
+    except Exception as e:
+        print(f"ERROR: Failed to update contact email: {e}")
+        return False, contact, old_email
 
 
 LICENSE_STATE_LABELS = {
@@ -621,12 +672,23 @@ def call_qwen_api(message_text, student_id, history=None):
         "или до какого числа действует доступ - в конце этого сообщения (после истории "
         "переписки) будет отдельный блок \"ДОСТУП ЭТОГО СТУДЕНТА ПРЯМО СЕЙЧАС\" - отвечай "
         "строго по нему, а не по общему каталогу курсов и не по истории переписки.\n"
+        "\n\n=== СМЕНА EMAIL ===\n"
+        "Если студент просит исправить/поменять свою почту (например, ошибся при оформлении "
+        "заказа) И явно написал новый адрес полностью (вида имя@домен.зона) - положи этот "
+        "адрес в поле requestedEmailChange формата ответа ниже. Саму смену и текст "
+        "подтверждения сделает код, а не ты - в reply в этом случае просто напиши что-то "
+        "нейтральное вроде \"Секунду, обновляю почту...\", не утверждай, что уже сделано. "
+        "Если студент просит поменять почту, но НЕ написал новый адрес (или написал что-то "
+        "не похожее на email) - НЕ заполняй requestedEmailChange, а в reply попроси прислать "
+        "новый адрес полностью.\n"
         "\n\n=== ФОРМАТ ОТВЕТА ===\n"
         "Отвечай СТРОГО в формате JSON, без markdown-разметки и пояснений вокруг, вот так:\n"
-        '{"reply": "текст ответа для студента", "needs_human": true или false}\n\n'
+        '{"reply": "текст ответа для студента", "needs_human": true или false, '
+        '"requestedEmailChange": "новый@адрес.ru или null"}\n\n'
         "needs_human = true, если вопрос попадает в раздел \"когда обязательно звать человека\" "
         "или если ты не можешь уверенно ответить на основе базы знаний.\n"
-        "needs_human = false, если ты полностью и уверенно ответил на основе базы знаний."
+        "needs_human = false, если ты полностью и уверенно ответил на основе базы знаний.\n"
+        "requestedEmailChange = null, если студент не просил сменить email в этом сообщении."
     )
 
     # Блок доступа приклеивается к ПОСЛЕДНЕМУ user-сообщению (тому самому, на которое модель
@@ -686,8 +748,39 @@ def call_qwen_api(message_text, student_id, history=None):
         parsed = json.loads(cleaned)
         reply = parsed.get("reply", "Извините, произошла ошибка. Попробуйте позже.")
         needs_human = bool(parsed.get("needs_human", False))
+        requested_email = parsed.get("requestedEmailChange")
 
-        print(f"DEBUG: Parsed reply='{reply[:80]}...' needs_human={needs_human}")
+        print(f"DEBUG: Parsed reply='{reply[:80]}...' needs_human={needs_human} requestedEmailChange={requested_email}")
+
+        # Саму смену email и текст итогового ответа формируем в коде, а не доверяем модели -
+        # она не знает заранее, удастся ли реально обновить контакт в Prodamus.
+        if requested_email and isinstance(requested_email, str) and requested_email.lower() != "null":
+            requested_email = requested_email.strip()
+            if not EMAIL_RE.match(requested_email):
+                reply = (
+                    f"Адрес «{requested_email}» не похож на настоящий email. "
+                    "Пришлите, пожалуйста, полный адрес вида имя@домен.ru."
+                )
+                needs_human = False
+            else:
+                success, contact, old_email = update_student_email(student_id, requested_email)
+                if success:
+                    reply = (
+                        f"Готово, обновил почту на {requested_email}. "
+                        "Письма с доступом и вся переписка теперь будут приходить на новый адрес — "
+                        "проверьте, пожалуйста, папку «Спам», если письмо не придёт сразу."
+                    )
+                    needs_human = False
+                    send_telegram_notification(
+                        "✅ Бот сменил email студента\n\n"
+                        f"ID студента: {student_id}\n"
+                        f"Старый email: {old_email or 'неизвестно'}\n"
+                        f"Новый email: {requested_email}"
+                    )
+                else:
+                    reply = "Не получилось автоматически поменять почту — сейчас передам это специалисту."
+                    needs_human = True
+
         return reply, needs_human
 
     except json.JSONDecodeError as e:
