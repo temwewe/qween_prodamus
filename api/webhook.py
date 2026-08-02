@@ -755,6 +755,40 @@ def update_student_email(student_id, new_email):
         return False, contact, old_email
 
 
+# Сценарии Prodamus, которые бот умеет запускать для оформления заказа/оплаты
+# конкретного продукта. Каждый сценарий сам создаёт заказ и присылает студенту ссылку
+# на оплату отдельным сообщением в чат - бот НЕ формирует и не показывает ссылку сам,
+# только запускает сценарий и честно предупреждает, что ссылка придёт следующим
+# сообщением. Если сценарий не запускается (success=false/ошибка) - продажа этого
+# продукта сейчас закрыта (подтверждено владельцем школы). Пока подключён только один
+# продукт - добавляйте новые пары "ключ: scenarioId" сюда по мере появления.
+PURCHASE_SCENARIOS = {
+    "ultrasound_friends": "0VXw8J5nRUq1xThZmP2pkg",  # Закрытый Telegram-канал ULTRASOUND FRIENDS
+}
+
+
+def run_scenario(scenario_id, contact_id):
+    """POST /api/v1/scenario/run - запускает сценарий Prodamus для существующего контакта."""
+    url = f"{PRODAMUS_BASE_URL}/scenario/run"
+    headers = {
+        "Authorization": f"Bearer {PRODAMUS_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {"scenarioId": scenario_id, "contactId": contact_id}
+
+    try:
+        response = requests.post(url, headers=headers, json=payload, timeout=15)
+        print(f"DEBUG: Run scenario status={response.status_code}")
+        print(f"DEBUG: Run scenario body: {response.text[:500]}")
+        if response.status_code != 200:
+            return False
+        data = response.json()
+        return bool(data.get("success"))
+    except Exception as e:
+        print(f"ERROR: Failed to run scenario: {e}")
+        return False
+
+
 LICENSE_STATE_LABELS = {
     "active": "включён",
     "paused": "приостановлен администратором",
@@ -1100,14 +1134,27 @@ def call_qwen_api(message_text, student_id, history=None, global_dates_text="", 
         "написал что-то не похожее на email, или в сообщении вообще нет речи о смене email) - "
         "requestedEmailChange ОБЯЗАТЕЛЬНО null, а reply НЕ должен содержать фраз про "
         "\"обновляю\"/\"секунду\" - если адреса нет, прямо попроси прислать его полностью.\n"
+        "\n\n=== ОФОРМЛЕНИЕ ЗАКАЗА ЧЕРЕЗ СЦЕНАРИЙ ===\n"
+        "Бот умеет САМ оформить заказ и запустить отправку ссылки на оплату для "
+        "ограниченного списка продуктов (пока только один - закрытый Telegram-канал "
+        "ULTRASOUND FRIENDS). Если студент ЯВНО хочет купить/оформить/подписаться именно "
+        "на этот продукт - положи \"ultrasound_friends\" в поле requestedPurchase. В "
+        "reply в этом случае пиши что-то нейтральное вроде \"Секунду, оформляю заказ...\" "
+        "- саму отправку ссылки делает отдельный сценарий Prodamus, не ты, поэтому НЕ "
+        "пиши и не выдумывай саму ссылку на оплату, даже примерную. Для любого другого "
+        "продукта/курса requestedPurchase ОБЯЗАТЕЛЬНО null - автоматическое оформление "
+        "для них не подключено, направляй студента на сайт школы или зови человека как "
+        "обычно.\n"
         "\n\n=== ФОРМАТ ОТВЕТА ===\n"
         "Отвечай СТРОГО в формате JSON, без markdown-разметки и пояснений вокруг, вот так:\n"
         '{"reply": "текст ответа для студента", "needs_human": true или false, '
-        '"requestedEmailChange": "новый@адрес.ru или null"}\n\n'
+        '"requestedEmailChange": "новый@адрес.ru или null", '
+        '"requestedPurchase": "ultrasound_friends или null"}\n\n'
         "needs_human = true, если вопрос попадает в раздел \"когда обязательно звать человека\" "
         "или если ты не можешь уверенно ответить на основе базы знаний.\n"
         "needs_human = false, если ты полностью и уверенно ответил на основе базы знаний.\n"
-        "requestedEmailChange = null, если студент не просил сменить email в этом сообщении."
+        "requestedEmailChange = null, если студент не просил сменить email в этом сообщении.\n"
+        "requestedPurchase = null, если студент не просил оформить заказ на ultrasound_friends."
     )
 
     # Блок доступа приклеивается к ПОСЛЕДНЕМУ user-сообщению (тому самому, на которое модель
@@ -1221,8 +1268,12 @@ def call_qwen_api(message_text, student_id, history=None, global_dates_text="", 
         reply = parsed.get("reply", "Извините, произошла ошибка. Попробуйте позже.")
         needs_human = bool(parsed.get("needs_human", False))
         requested_email = parsed.get("requestedEmailChange")
+        requested_purchase = parsed.get("requestedPurchase")
 
-        print(f"DEBUG: Parsed reply='{reply[:80]}...' needs_human={needs_human} requestedEmailChange={requested_email}")
+        print(
+            f"DEBUG: Parsed reply='{reply[:80]}...' needs_human={needs_human} "
+            f"requestedEmailChange={requested_email} requestedPurchase={requested_purchase}"
+        )
 
         # Саму смену email и текст итогового ответа формируем в коде, а не доверяем модели -
         # она не знает заранее, удастся ли реально обновить контакт в Prodamus.
@@ -1251,6 +1302,37 @@ def call_qwen_api(message_text, student_id, history=None, global_dates_text="", 
                     )
                 else:
                     reply = "Не получилось автоматически поменять почту — сейчас передам это специалисту."
+                    needs_human = True
+
+        # Саму покупку и текст итогового ответа формируем в коде, а не доверяем модели -
+        # запуск сценария Prodamus создаёт заказ и сам присылает ссылку на оплату
+        # отдельным сообщением, наш бот эту ссылку не видит и не формирует.
+        if requested_purchase and isinstance(requested_purchase, str) and requested_purchase.lower() != "null":
+            requested_purchase = requested_purchase.strip()
+            scenario_id = PURCHASE_SCENARIOS.get(requested_purchase)
+            if not scenario_id:
+                print(f"WARNING: Unknown requestedPurchase key from model: {requested_purchase}")
+                reply = "Не могу оформить этот заказ автоматически — сейчас передам это специалисту."
+                needs_human = True
+            else:
+                success = run_scenario(scenario_id, student_id)
+                if success:
+                    reply = (
+                        "Готово, оформляю заказ — ссылка на оплату придёт отдельным сообщением "
+                        "в этот же чат в течение минуты. Если не придёт - напишите, и я передам "
+                        "специалисту."
+                    )
+                    needs_human = False
+                    send_telegram_notification(
+                        "🛒 Бот запустил сценарий оформления заказа\n\n"
+                        f"ID студента: {student_id}\n"
+                        f"Продукт: {requested_purchase}"
+                    )
+                else:
+                    reply = (
+                        "Сейчас не получилось оформить заказ автоматически (возможно, продажа "
+                        "этого продукта сейчас закрыта) — передаю специалисту."
+                    )
                     needs_human = True
 
         # Модель может сама выдумать правдоподобную ссылку на оплату вместо честного
