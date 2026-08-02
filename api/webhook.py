@@ -415,13 +415,6 @@ def fetch_full_contact(student_id):
         return None
 
 
-def contact_is_ai_paused(contact):
-    if not contact:
-        return False
-    tags = contact.get("tags") or []
-    return AI_PAUSED_TAG in tags
-
-
 def add_ai_paused_tag(contact, known_current_tags=None):
     """
     Добавляем тег AI_PAUSED_TAG и отправляем ВЕСЬ объект контакта обратно через PUT
@@ -644,7 +637,12 @@ def call_qwen_api(message_text, student_id, history=None):
             [{"role": "system", "content": system_prompt}]
             + (history or [])
             + [{"role": "user", "content": message_text}]
-        )
+        ),
+        # Без этого Qwen иногда игнорирует инструкцию про формат ответа и отвечает
+        # обычным текстом вместо JSON - тогда парсинг падает и needs_human=True
+        # выставляется "на всякий случай" даже если по сути отвечать было не нужно.
+        # response_format форсирует валидный JSON на стороне самой модели.
+        "response_format": {"type": "json_object"}
     }
 
     try:
@@ -897,7 +895,25 @@ def webhook():
             # молчать, чтобы не влезть в разговор, где сейчас работает человек
             print("DEBUG: AI paused per webhook tags, live contact check failed - staying safe, skipping")
             return jsonify({"status": "ignored", "message": "AI paused for this contact (unverified)"}), 200
-        if contact_is_ai_paused(contact_check):
+
+        live_tags = contact_check.get("tags") or []
+        other_tags_from_webhook = [t for t in tags_from_webhook if t != AI_PAUSED_TAG]
+
+        # Второй известный глюк Prodamus (в обратную сторону от первого): GET /crm/lead
+        # иногда отдаёт СОВЕРШЕННО ПУСТОЙ список тегов, даже когда у контакта их реально
+        # несколько. Если вебхук только что показывал другие теги этого контакта (не
+        # только ai_paused), а живой GET вдруг говорит "тегов нет вообще" - это больше
+        # похоже на сбой самого GET, чем на то, что все теги разом сняли. В этом случае
+        # не доверяем "чистому" результату и подстраховываемся - остаёмся на паузе.
+        if not live_tags and other_tags_from_webhook:
+            print(
+                f"DEBUG: Live contact fetch returned NO tags at all, but webhook showed "
+                f"other tags {other_tags_from_webhook} for this contact - looks like a "
+                f"stale/broken GET response, not a real tag removal. Staying paused to be safe."
+            )
+            return jsonify({"status": "ignored", "message": "AI paused for this contact (GET looked unreliable)"}), 200
+
+        if AI_PAUSED_TAG in live_tags:
             print(f"DEBUG: AI is paused for this contact (confirmed via live contact fetch) - skipping")
             return jsonify({"status": "ignored", "message": "AI paused for this contact"}), 200
         print(f"DEBUG: Webhook showed stale '{AI_PAUSED_TAG}' tag, but live contact fetch shows it's removed - resuming")
