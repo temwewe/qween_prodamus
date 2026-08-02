@@ -1084,7 +1084,7 @@ def fetch_recent_channel_messages(chat_channel_id, student_id, take):
     try:
         response = requests.get(url, headers=headers, params=params, timeout=10)
         print(f"DEBUG: Get recent messages status={response.status_code}")
-        print(f"DEBUG: Get recent messages body: {response.text[:800]}")
+        print(f"DEBUG: Get recent messages body: {response.text[:4000]}")
 
         if response.status_code == 200:
             data = response.json()
