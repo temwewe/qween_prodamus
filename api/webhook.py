@@ -281,6 +281,48 @@ def build_global_dates_text(data):
     return "\n".join(lines)
 
 
+# Три ступени цены на каждый из трёх курсов - тоже глобальные переменные Prodamus
+# (PriceMin/PriceMid/PriceFull . lap/thyroid/spleen), переданные в теле вебхука через
+# {Global.PriceMin.X}/{Global.PriceMid.X}/{Global.PriceFull.X}. Это МАРКЕТИНГОВЫЙ график
+# скидок (что показывать студенту как "текущую" цену по мере приближения официального
+# старта продаж) - НЕ то же самое, что реальная цена в чекауте (она берётся из каталога
+# Prodamus, см. get_catalog_text). Сейчас (подтверждено владельцем школы) у ЛАП и
+# Селезёнки минимальная и средняя цена совпадают - разные ступени пока только у
+# щитовидки, поэтому одинаковые соседние ступени схлопываются в одну при выводе.
+GLOBAL_PRICE_COURSES = [
+    ("Lap", "Дифференциальная УЗД лимфаденопатий (ЛАП)"),
+    ("Thyroid", "УЗИ щитовидной железы"),
+    ("Spleen", "Селезёнка — забытый остров"),
+]
+GLOBAL_PRICE_TIERS = [
+    ("priceMin", "минимальная цена, макс. скидка"),
+    ("priceMid", "цена на старте официальных продаж"),
+    ("priceFull", "основная цена"),
+]
+
+
+def build_global_prices_text(data):
+    def clean(value):
+        if not value or "#" in str(value) or "{" in str(value):
+            return None
+        return str(value).strip()
+
+    lines = []
+    for course_key, course_label in GLOBAL_PRICE_COURSES:
+        tiers = []
+        prev_value = None
+        for field_prefix, tier_label in GLOBAL_PRICE_TIERS:
+            value = clean(data.get(f"{field_prefix}{course_key}"))
+            if not value or value == prev_value:
+                continue  # не резолвилось, либо та же цена что и на предыдущей ступени
+            tiers.append(f"{value} ({tier_label})")
+            prev_value = value
+        if tiers:
+            lines.append(f"- «{course_label}»: " + " → ".join(tiers))
+
+    return "\n".join(lines)
+
+
 def get_catalog_text():
     """Каталог с кэшем по TTL - Prodamus API дёргается не чаще раза в CATALOG_CACHE_TTL_SECONDS."""
     now = time.time()
@@ -916,7 +958,7 @@ def build_student_orders_text(student_id):
     return "\n".join(lines), valid_links
 
 
-def call_qwen_api(message_text, student_id, history=None, global_dates_text=""):
+def call_qwen_api(message_text, student_id, history=None, global_dates_text="", global_prices_text=""):
     """
     Возвращает (reply_text, needs_human).
 
@@ -926,6 +968,8 @@ def call_qwen_api(message_text, student_id, history=None, global_dates_text=""):
 
     global_dates_text - даты старта обучения/официального старта продаж из глобальных
     переменных Prodamus, см. build_global_dates_text().
+    global_prices_text - ступени цен (маркетинговый график скидок) из глобальных
+    переменных Prodamus, см. build_global_prices_text().
 
     Просим Qwen отвечать строго в формате JSON, чтобы явно понимать,
     нужно ли звать человека, без хрупкого поиска ключевых слов в тексте.
@@ -1017,6 +1061,18 @@ def call_qwen_api(message_text, student_id, history=None, global_dates_text=""):
             "официальной даты для узкого круга (например, для тех, кто в предзаписи), "
             "поэтому не утверждай, что курс точно закрыт до этой даты, если пометка "
             "\"[сейчас не в открытой продаже]\" у него отсутствует."
+        )
+
+    if global_prices_text:
+        catalog_reminder += (
+            "\n\n=== ГРАФИК ЦЕН ПО СТУПЕНЯМ (из Prodamus) ===\n"
+            + global_prices_text +
+            "\n\nЭто маркетинговый график скидок по времени (цена растёт по мере "
+            "приближения официального старта продаж) для информационных ответов вида "
+            "\"как меняется цена\" или \"почему сейчас дешевле/дороже\". РЕАЛЬНАЯ цена, "
+            "которую студент заплатит при оформлении заказа прямо сейчас - та, что указана "
+            "в каталоге курсов/продуктов выше, ей и отвечай на вопрос \"сколько стоит\", "
+            "а не арифметически вычисляй ступень сам."
         )
 
     access_reminder = (
@@ -1332,6 +1388,7 @@ def webhook():
     )
     tags_from_webhook = parse_tags(data.get("tags") or data.get("Tags"))
     global_dates_text = build_global_dates_text(data)
+    global_prices_text = build_global_prices_text(data)
 
     print(f"DEBUG: Parsed:")
     print(f"  student_id:       {student_id}")
@@ -1403,7 +1460,9 @@ def webhook():
     # 1. Получаем ответ от Qwen (с учётом общей базы знаний школы, доступа этого студента
     # и истории последних сообщений диалога)
     print(f"DEBUG: Calling Qwen with: '{message_text[:80]}...'")
-    ai_response, needs_human = call_qwen_api(message_text, student_id, conversation_history, global_dates_text)
+    ai_response, needs_human = call_qwen_api(
+        message_text, student_id, conversation_history, global_dates_text, global_prices_text
+    )
     print(f"DEBUG: AI response: '{ai_response[:80]}...' needs_human={needs_human}")
 
     # 1.5 Если нужен человек - читаем контакт через API (email/имя + база для read-merge-write),
