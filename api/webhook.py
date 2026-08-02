@@ -5,6 +5,7 @@ import json
 import re
 import time
 import hmac
+from datetime import date, timedelta, datetime, timezone
 from html import unescape
 
 app = Flask(__name__)
@@ -283,42 +284,83 @@ def build_global_dates_text(data):
 
 # Три ступени цены на каждый из трёх курсов - тоже глобальные переменные Prodamus
 # (PriceMin/PriceMid/PriceFull . lap/thyroid/spleen), переданные в теле вебхука через
-# {Global.PriceMin.X}/{Global.PriceMid.X}/{Global.PriceFull.X}. Это МАРКЕТИНГОВЫЙ график
-# скидок (что показывать студенту как "текущую" цену по мере приближения официального
-# старта продаж) - НЕ то же самое, что реальная цена в чекауте (она берётся из каталога
-# Prodamus, см. get_catalog_text). Сейчас (подтверждено владельцем школы) у ЛАП и
-# Селезёнки минимальная и средняя цена совпадают - разные ступени пока только у
-# щитовидки, поэтому одинаковые соседние ступени схлопываются в одну при выводе.
+# {Global.PriceMin.X}/{Global.PriceMid.X}/{Global.PriceFull.X}. Расписание ступеней
+# (подтверждено владельцем школы):
+#   - минимальная цена - последняя неделя ПЕРЕД официальным стартом продаж (Sell.X)
+#   - средняя цена     - от Sell.X до недели ПЕРЕД стартом обучения (Start.X)
+#   - основная цена    - последняя неделя перед стартом обучения (Start.X) и далее
+# Студенту нужно показывать ТОЛЬКО ту цену, что актуальна сейчас, а не весь график.
 GLOBAL_PRICE_COURSES = [
     ("Lap", "Дифференциальная УЗД лимфаденопатий (ЛАП)"),
     ("Thyroid", "УЗИ щитовидной железы"),
     ("Spleen", "Селезёнка — забытый остров"),
 ]
-GLOBAL_PRICE_TIERS = [
-    ("priceMin", "минимальная цена, макс. скидка"),
-    ("priceMid", "цена на старте официальных продаж"),
-    ("priceFull", "основная цена"),
-]
+
+RUSSIAN_MONTHS = {
+    "январь": 1, "января": 1, "февраль": 2, "февраля": 2, "март": 3, "марта": 3,
+    "апрель": 4, "апреля": 4, "май": 5, "мая": 5, "июнь": 6, "июня": 6,
+    "июль": 7, "июля": 7, "август": 8, "августа": 8, "сентябрь": 9, "сентября": 9,
+    "октябрь": 10, "октября": 10, "ноябрь": 11, "ноября": 11, "декабрь": 12, "декабря": 12,
+}
 
 
-def build_global_prices_text(data):
+def _parse_russian_date(text):
+    """
+    Разбирает дату вида "8 сентября 2026г" (обязательно день+месяц+год). Форматы без
+    дня ("январь 2027г") или без даты вообще ("Скоро...") сознательно возвращают None -
+    угадывать день ради расчёта окна "-7 дней" опаснее, чем просто не показывать цену.
+    """
+    if not text:
+        return None
+    match = re.search(r"(\d{1,2})\s+([а-яёА-ЯЁ]+)\s+(\d{4})", str(text))
+    if not match:
+        return None
+    day_str, month_name, year_str = match.groups()
+    month = RUSSIAN_MONTHS.get(month_name.lower())
+    if not month:
+        return None
+    try:
+        return date(int(year_str), month, int(day_str))
+    except ValueError:
+        return None
+
+
+def build_current_price_text(data):
+    """
+    Возвращает ТОЛЬКО актуальную сейчас цену по каждому курсу (не весь график скидок),
+    вычисляя нужную ступень по датам Start.X/Sell.X из тела вебхука. Курс пропускается,
+    если обе даты не удалось разобрать с точностью до дня - в этом случае пусть модель
+    использует цену из каталога Prodamus (она всегда актуальна для чекаута).
+    """
     def clean(value):
         if not value or "#" in str(value) or "{" in str(value):
             return None
         return str(value).strip()
 
+    today = datetime.now(timezone.utc).date()
     lines = []
+
     for course_key, course_label in GLOBAL_PRICE_COURSES:
-        tiers = []
-        prev_value = None
-        for field_prefix, tier_label in GLOBAL_PRICE_TIERS:
-            value = clean(data.get(f"{field_prefix}{course_key}"))
-            if not value or value == prev_value:
-                continue  # не резолвилось, либо та же цена что и на предыдущей ступени
-            tiers.append(f"{value} ({tier_label})")
-            prev_value = value
-        if tiers:
-            lines.append(f"- «{course_label}»: " + " → ".join(tiers))
+        sell_date = _parse_russian_date(data.get(f"sell{course_key}"))
+        start_date = _parse_russian_date(data.get(f"start{course_key}"))
+        if not sell_date or not start_date:
+            continue
+
+        week_before_sell = sell_date - timedelta(days=7)
+        week_before_start = start_date - timedelta(days=7)
+
+        if today < week_before_sell:
+            continue  # больше чем за неделю до старта продаж - цена ещё не актуальна
+
+        if today < sell_date:
+            price, tier_note = clean(data.get(f"priceMin{course_key}")), "минимальная цена"
+        elif today < week_before_start:
+            price, tier_note = clean(data.get(f"priceMid{course_key}")), "цена на старте продаж"
+        else:
+            price, tier_note = clean(data.get(f"priceFull{course_key}")), "основная цена"
+
+        if price:
+            lines.append(f"- «{course_label}»: {price} ({tier_note})")
 
     return "\n".join(lines)
 
@@ -958,7 +1000,7 @@ def build_student_orders_text(student_id):
     return "\n".join(lines), valid_links
 
 
-def call_qwen_api(message_text, student_id, history=None, global_dates_text="", global_prices_text=""):
+def call_qwen_api(message_text, student_id, history=None, global_dates_text="", current_price_text=""):
     """
     Возвращает (reply_text, needs_human).
 
@@ -968,8 +1010,8 @@ def call_qwen_api(message_text, student_id, history=None, global_dates_text="", 
 
     global_dates_text - даты старта обучения/официального старта продаж из глобальных
     переменных Prodamus, см. build_global_dates_text().
-    global_prices_text - ступени цен (маркетинговый график скидок) из глобальных
-    переменных Prodamus, см. build_global_prices_text().
+    current_price_text - актуальная СЕЙЧАС цена (одна ступень, не весь график) из
+    глобальных переменных Prodamus, см. build_current_price_text().
 
     Просим Qwen отвечать строго в формате JSON, чтобы явно понимать,
     нужно ли звать человека, без хрупкого поиска ключевых слов в тексте.
@@ -1063,16 +1105,15 @@ def call_qwen_api(message_text, student_id, history=None, global_dates_text="", 
             "\"[сейчас не в открытой продаже]\" у него отсутствует."
         )
 
-    if global_prices_text:
+    if current_price_text:
         catalog_reminder += (
-            "\n\n=== ГРАФИК ЦЕН ПО СТУПЕНЯМ (из Prodamus) ===\n"
-            + global_prices_text +
-            "\n\nЭто маркетинговый график скидок по времени (цена растёт по мере "
-            "приближения официального старта продаж) для информационных ответов вида "
-            "\"как меняется цена\" или \"почему сейчас дешевле/дороже\". РЕАЛЬНАЯ цена, "
-            "которую студент заплатит при оформлении заказа прямо сейчас - та, что указана "
-            "в каталоге курсов/продуктов выше, ей и отвечай на вопрос \"сколько стоит\", "
-            "а не арифметически вычисляй ступень сам."
+            "\n\n=== АКТУАЛЬНАЯ ЦЕНА СЕЙЧАС ПО ГРАФИКУ СКИДОК (из Prodamus, уже вычислена "
+            "для СЕГОДНЯШНЕЙ даты) ===\n"
+            + current_price_text +
+            "\n\nЭто именно та цена, которая действует ПРЯМО СЕЙЧАС по графику скидок школы - "
+            "не показывай студенту другие ступени этого графика и не пересчитывай сама "
+            "(расчёт по датам уже сделан кодом). Если по какому-то курсу здесь ничего нет - "
+            "используй цену из каталога курсов/продуктов выше."
         )
 
     access_reminder = (
@@ -1388,7 +1429,7 @@ def webhook():
     )
     tags_from_webhook = parse_tags(data.get("tags") or data.get("Tags"))
     global_dates_text = build_global_dates_text(data)
-    global_prices_text = build_global_prices_text(data)
+    current_price_text = build_current_price_text(data)
 
     print(f"DEBUG: Parsed:")
     print(f"  student_id:       {student_id}")
@@ -1461,7 +1502,7 @@ def webhook():
     # и истории последних сообщений диалога)
     print(f"DEBUG: Calling Qwen with: '{message_text[:80]}...'")
     ai_response, needs_human = call_qwen_api(
-        message_text, student_id, conversation_history, global_dates_text, global_prices_text
+        message_text, student_id, conversation_history, global_dates_text, current_price_text
     )
     print(f"DEBUG: AI response: '{ai_response[:80]}...' needs_human={needs_human}")
 
