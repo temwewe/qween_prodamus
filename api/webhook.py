@@ -151,6 +151,24 @@ def _is_currently_open_for_sale(name):
     return any(hint in name_lower for hint in CURRENTLY_OPEN_FOR_SALE_NAME_HINTS)
 
 
+# Ссылки на лист ожидания (предзапись) для курсов, которые сейчас не в открытой продаже -
+# подтверждены владельцем школы как рабочие. Сопоставление тем же способом, что и
+# CURRENTLY_OPEN_FOR_SALE_NAME_HINTS - по вхождению строки в название (регистронезависимо).
+WAITLIST_LINKS = [
+    ("лимфаденопат", "https://store.timofeeva-online.ru/wlymph"),
+    ("щитовид", "https://store.timofeeva-online.ru/wthyroid"),
+    ("селезён", "https://store.timofeeva-online.ru/wspleen"),
+]
+
+
+def _waitlist_link_for(name):
+    name_lower = (name or "").lower()
+    for hint, url in WAITLIST_LINKS:
+        if hint in name_lower:
+            return url
+    return None
+
+
 def build_catalog_text():
     """
     Собирает текстовый каталог из Prodamus:
@@ -214,7 +232,9 @@ def build_catalog_text():
             flow_date = t.get("flowDate") or {}
             if flow_date.get("beginDate"):
                 start = f", старт потока: {flow_date['beginDate'][:10]}"
-            lines.append(f"  - Тариф «{t.get('name')}»: {price}{duration}{start}{availability}")
+            waitlist_link = "" if is_open else (_waitlist_link_for(course.get("name")) or "")
+            waitlist_text = f", лист ожидания: {waitlist_link}" if waitlist_link else ""
+            lines.append(f"  - Тариф «{t.get('name')}»: {price}{duration}{start}{availability}{waitlist_text}")
             desc = _strip_html(t.get("description"))
             if desc:
                 lines.append(f"    {desc}")
@@ -232,7 +252,9 @@ def build_catalog_text():
             availability = "" if is_open else " [сейчас не в открытой продаже]"
             (open_names if is_open else closed_names).append(f"«{p.get('name')}»")
             price = _format_price(p)
-            lines.append(f"  - «{p.get('name')}»: {price}{availability}")
+            waitlist_link = "" if is_open else (_waitlist_link_for(p.get("name")) or "")
+            waitlist_text = f", лист ожидания: {waitlist_link}" if waitlist_link else ""
+            lines.append(f"  - «{p.get('name')}»: {price}{availability}{waitlist_text}")
             desc = _strip_html(p.get("description"))
             if desc:
                 lines.append(f"    {desc}")
@@ -928,21 +950,31 @@ def _split_payment_link(order):
     return f"{SPLIT_PAYMENT_CHECKOUT_URL}?orderId={order_id}&partValue={part_value}"
 
 
-CHECKOUT_URL_RE = re.compile(r"https?://\S*checkout\S*", re.IGNORECASE)
+# Ловим и ссылки на оплату (.../checkout...), и ссылки на лист ожидания
+# (store.timofeeva-online.ru/w...) - оба типа модель на практике пыталась выдумывать.
+SENSITIVE_URL_RE = re.compile(
+    r"https?://\S*checkout\S*|https?://store\.timofeeva-online\.ru/\S*",
+    re.IGNORECASE,
+)
+
+KNOWN_WAITLIST_LINKS = frozenset(url for _, url in WAITLIST_LINKS)
 
 
 def _sanitize_reply_payment_links(reply, allowed_links):
     """
-    Последний рубеж защиты от того, что модель сама придумает ссылку на оплату вместо
-    честного "не знаю" - это реально случалось. Любая ссылка вида .../checkout... в
-    ответе, которая не совпадает буква в букву с одной из ссылок, которые мы САМИ
-    сгенерировали в build_student_orders_text() в этом же запросе, считается
-    непроверенной. Возвращает None, если найдена хоть одна такая ссылка (сигнал
-    вызывающему коду заменить ответ на эскалацию к человеку), иначе - исходный reply.
+    Последний рубеж защиты от того, что модель сама придумает ссылку на оплату или на
+    лист ожидания вместо честного "не знаю" - оба случая реально происходили. Любая
+    ссылка на оплату или на store.timofeeva-online.ru в ответе, которая не совпадает
+    буква в букву ни с одной из ссылок, которые мы САМИ сгенерировали в этом запросе
+    (build_student_orders_text), ни с одной из известных статичных ссылок на лист
+    ожидания (WAITLIST_LINKS), считается непроверенной. Возвращает None, если найдена
+    хоть одна такая ссылка (сигнал вызывающему коду заменить ответ на эскалацию к
+    человеку), иначе - исходный reply.
     """
-    for match in CHECKOUT_URL_RE.findall(reply):
+    combined_allowed = set(allowed_links) | KNOWN_WAITLIST_LINKS
+    for match in SENSITIVE_URL_RE.findall(reply):
         cleaned = match.rstrip(").,;»\"'")
-        if cleaned not in allowed_links:
+        if cleaned not in combined_allowed:
             return None
     return reply
 
@@ -1093,10 +1125,15 @@ def call_qwen_api(message_text, student_id, history=None, global_dates_text="", 
         "НЕЛЬЗЯ купить прямо сейчас, даже если у него есть цена и описание. Если студент "
         "спрашивает \"что сейчас в продаже\" или можно ли купить конкретный курс - НЕ "
         "перечисляй и не подтверждай доступность курсов/тарифов с этой пометкой, только те, "
-        "у которых её нет. Для курсов с пометкой - предложи лист ожидания или подписку на "
-        "Telegram/Max-группу школы. Наличие у студента личного доступа к курсу (см. блок "
-        "ДОСТУП ниже) - это отдельный вопрос и НЕ означает, что курс сейчас открыт для новых "
-        "покупок."
+        "у которых её нет. Для курса/тарифа с пометкой, у которого рядом указана ссылка "
+        "\"лист ожидания\" - спроси студента что-то вроде \"хотите, пришлю вам ссылку для "
+        "предзаписи на этот курс? Так вы получите уведомление о специальной цене для "
+        "участников предзаписи\" и, если он согласен (или сразу, если он сам попросил "
+        "лист ожидания/предзапись) - пришли именно эту ссылку из блока каталога, не "
+        "выдумывай другую. Если ссылки на лист ожидания рядом нет - предложи подписку на "
+        "Telegram/Max-группу школы вместо неё. Наличие у студента личного доступа к курсу "
+        "(см. блок ДОСТУП ниже) - это отдельный вопрос и НЕ означает, что курс сейчас "
+        "открыт для новых покупок."
     )
 
     if global_dates_text:
