@@ -180,6 +180,12 @@ def build_catalog_text():
         else:
             standalone_products.append(p)
 
+    # Отдельные явные списки "открыто"/"закрыто" в начале текста - на практике надёжнее,
+    # чем инлайн-пометки внутри длинного детального перечисления: при кратком ответе на
+    # вопрос "что сейчас в продаже" модель их иначе теряла (подтверждено на реальном боте).
+    open_names = []
+    closed_names = []
+
     lines = ["=== КУРСЫ ==="]
 
     for course_id, course in courses_by_id.items():
@@ -196,6 +202,8 @@ def build_catalog_text():
         for t in sorted(tariffs, key=lambda x: x.get("price") or 0):
             is_open = _is_currently_open_for_sale(course.get("name")) or _is_currently_open_for_sale(t.get("name"))
             availability = "" if is_open else " [сейчас не в открытой продаже]"
+            tariff_label = f"«{course.get('name')}» (тариф «{t.get('name')}»)"
+            (open_names if is_open else closed_names).append(tariff_label)
             price = _format_price(t)
             duration = ""
             if t.get("duration") and t.get("durationType"):
@@ -219,14 +227,24 @@ def build_catalog_text():
     for cat_name, items in by_category.items():
         lines.append(f"\n{cat_name}:")
         for p in items:
-            availability = "" if _is_currently_open_for_sale(p.get("name")) else " [сейчас не в открытой продаже]"
+            is_open = _is_currently_open_for_sale(p.get("name"))
+            availability = "" if is_open else " [сейчас не в открытой продаже]"
+            (open_names if is_open else closed_names).append(f"«{p.get('name')}»")
             price = _format_price(p)
             lines.append(f"  - «{p.get('name')}»: {price}{availability}")
             desc = _strip_html(p.get("description"))
             if desc:
                 lines.append(f"    {desc}")
 
-    return "\n".join(lines)
+    summary = (
+        "=== СЕЙЧАС ОТКРЫТО ДЛЯ ПОКУПКИ (кратко) ===\n"
+        + ("\n".join(f"- {n}" for n in open_names) if open_names else "(ничего)")
+        + "\n\n=== СЕЙЧАС НЕ В ОТКРЫТОЙ ПРОДАЖЕ (кратко, доступно по листу ожидания) ===\n"
+        + ("\n".join(f"- {n}" for n in closed_names) if closed_names else "(ничего)")
+        + "\n"
+    )
+
+    return summary + "\n" + "\n".join(lines)
 
 
 def get_catalog_text():
