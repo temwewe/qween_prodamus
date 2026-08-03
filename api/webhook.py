@@ -1786,6 +1786,20 @@ def webhook():
     student_email = extract_student_email(recent_items, student_id)
     print(f"DEBUG: Student email (from recent messages): {student_email}")
 
+    # Если email подтверждённо отсутствует (не "не удалось определить", а реально пуст в
+    # CRM) - сразу запускаем штатный сценарий Prodamus запроса/привязки email, БЕЗ
+    # обращения к нейросети вообще - подтверждено владельцем школы: у этого сценария
+    # свой правильный UI (как у /start), а не произвольная формулировка модели.
+    # Исключение - если студент ЭТИМ ЖЕ сообщением уже прислал email: тогда пропускаем
+    # сценарий и даём обычному потоку (Qwen + requestedEmailChange) обработать его.
+    if student_email == "" and not EMAIL_RE.match((message_text or "").strip()):
+        print("DEBUG: Email confirmed missing - running link/request-email scenario, skipping Qwen")
+        scenario_ok = run_scenario(LINK_ACCOUNT_BY_EMAIL_SCENARIO_ID, student_id)
+        print(f"DEBUG: Link/request-email scenario (no AI call) success={scenario_ok}")
+        if scenario_ok:
+            return jsonify({"status": "ok", "message": "Email missing - request-email scenario triggered"}), 200
+        print("WARNING: Link/request-email scenario failed to run - falling back to normal Qwen flow")
+
     # 1. Получаем ответ от Qwen (с учётом общей базы знаний школы, доступа этого студента
     # и истории последних сообщений диалога)
     print(f"DEBUG: Calling Qwen with: '{message_text[:80]}...'")
