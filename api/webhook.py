@@ -730,6 +730,20 @@ def notify_human(contact, student_id, message_text, ai_reply):
 
 EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 
+# Модель может по инерции разговора выставить requestedPurchase на вопрос, который не
+# является покупкой (например, "какие у меня заказы?" сразу после реальной покупки в
+# этом же диалоге) - подтверждено ДВАЖДЫ на практике: сначала на curl-тесте с
+# захламлённой историей, затем на настоящем Telegram-сообщении "Какие у меня заказы?"
+# сразу после оформления заказа - оба раза модель создавала ДУБЛИРУЮЩИЙ реальный заказ
+# вместо ответа. Это запускает реальный сценарий Prodamus с реальными последствиями,
+# поэтому одной инструкции в промпте недостаточно, нужна проверка в коде. Если в САМОМ
+# сообщении студента нет явного намерения купить/оформить - requestedPurchase от модели
+# игнорируем, не запускаем сценарий и не перезаписываем её (уже готовый, информационный)
+# reply.
+PURCHASE_INTENT_RE = re.compile(
+    r"куп|оформ|подпиш|приобрет", re.IGNORECASE
+)
+
 
 def update_student_email(student_id, new_email):
     """
@@ -1241,7 +1255,12 @@ def call_qwen_api(message_text, student_id, history=None, global_dates_text="", 
         "независимо от того, какой тариф студент называет.\n"
         "- \"spleen\" -> курс «Селезёнка — забытый остров»\n"
         "Если студент ЯВНО хочет купить/оформить/подписаться на один из этих продуктов - "
-        "положи соответствующий ключ в поле requestedPurchase. В reply в этом случае пиши "
+        "положи соответствующий ключ в поле requestedPurchase. Вопрос про уже "
+        "существующие заказы (\"какие у меня заказы\", \"что я уже заказал\") - это НЕ "
+        "покупка, даже если раньше в этом же диалоге уже что-то покупали - в таких "
+        "случаях requestedPurchase ОБЯЗАТЕЛЬНО null, отвечай по блоку \"ЗАКАЗЫ И ОПЛАТА\" "
+        "ниже - это было реальной ошибкой ранее (бот создал повторный заказ вместо "
+        "ответа на \"какие у меня заказы?\"). В reply при реальной покупке пиши "
         "что-то нейтральное вроде \"Секунду, оформляю заказ...\" - саму отправку ссылки "
         "делает отдельный сценарий Prodamus, не ты, поэтому НЕ пиши и не выдумывай саму "
         "ссылку на оплату, даже примерную. Для любого другого продукта/курса, не из "
@@ -1505,31 +1524,41 @@ def call_qwen_api(message_text, student_id, history=None, global_dates_text="", 
         # отдельным сообщением, наш бот эту ссылку не видит и не формирует.
         if requested_purchase and isinstance(requested_purchase, str) and requested_purchase.lower() != "null":
             requested_purchase = requested_purchase.strip()
-            scenario_id = PURCHASE_SCENARIOS.get(requested_purchase)
-            if not scenario_id:
-                print(f"WARNING: Unknown requestedPurchase key from model: {requested_purchase}")
-                reply = "Не могу оформить этот заказ автоматически — сейчас передам это специалисту."
-                needs_human = True
+            if not PURCHASE_INTENT_RE.search(message_text or ""):
+                # Модель промахнулась (например, приняла "какие у меня заказы?" за
+                # желание купить, по инерции более ранней покупки в этом же диалоге) -
+                # НЕ запускаем реальный сценарий заказа и оставляем как есть тот reply,
+                # который модель уже сформировала для настоящего вопроса студента.
+                print(
+                    f"WARNING: Model set requestedPurchase={requested_purchase} but message "
+                    f"has no purchase-intent keywords - ignoring, message was: '{message_text[:200]}'"
+                )
             else:
-                success = run_scenario(scenario_id, student_id)
-                if success:
-                    reply = (
-                        "Готово, оформляю заказ — ссылка на оплату придёт отдельным сообщением "
-                        "в этот же чат в течение минуты. Если не придёт - напишите, и я передам "
-                        "специалисту."
-                    )
-                    needs_human = False
-                    send_telegram_notification(
-                        "🛒 Бот запустил сценарий оформления заказа\n\n"
-                        f"ID студента: {student_id}\n"
-                        f"Продукт: {requested_purchase}"
-                    )
-                else:
-                    reply = (
-                        "Сейчас не получилось оформить заказ автоматически (возможно, продажа "
-                        "этого продукта сейчас закрыта) — передаю специалисту."
-                    )
+                scenario_id = PURCHASE_SCENARIOS.get(requested_purchase)
+                if not scenario_id:
+                    print(f"WARNING: Unknown requestedPurchase key from model: {requested_purchase}")
+                    reply = "Не могу оформить этот заказ автоматически — сейчас передам это специалисту."
                     needs_human = True
+                else:
+                    success = run_scenario(scenario_id, student_id)
+                    if success:
+                        reply = (
+                            "Готово, оформляю заказ — ссылка на оплату придёт отдельным сообщением "
+                            "в этот же чат в течение минуты. Если не придёт - напишите, и я передам "
+                            "специалисту."
+                        )
+                        needs_human = False
+                        send_telegram_notification(
+                            "🛒 Бот запустил сценарий оформления заказа\n\n"
+                            f"ID студента: {student_id}\n"
+                            f"Продукт: {requested_purchase}"
+                        )
+                    else:
+                        reply = (
+                            "Сейчас не получилось оформить заказ автоматически (возможно, продажа "
+                            "этого продукта сейчас закрыта) — передаю специалисту."
+                        )
+                        needs_human = True
 
         # Модель может сама выдумать правдоподобную ссылку на оплату вместо честного
         # "не знаю" - подтверждено на практике (сфабриковала несуществующую ссылку на
