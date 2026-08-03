@@ -1077,7 +1077,8 @@ def build_student_orders_text(student_id):
     return "\n".join(lines), valid_links
 
 
-def call_qwen_api(message_text, student_id, history=None, global_dates_text="", current_price_text=""):
+def call_qwen_api(message_text, student_id, history=None, global_dates_text="", current_price_text="",
+                   student_email=None):
     """
     Возвращает (reply_text, needs_human).
 
@@ -1089,6 +1090,8 @@ def call_qwen_api(message_text, student_id, history=None, global_dates_text="", 
     переменных Prodamus, см. build_global_dates_text().
     current_price_text - актуальная СЕЙЧАС цена (одна ступень, не весь график) из
     глобальных переменных Prodamus, см. build_current_price_text().
+    student_email - текущий email студента (из карточки контакта), см.
+    extract_student_email(). Может быть None, если его не удалось определить.
 
     Просим Qwen отвечать строго в формате JSON, чтобы явно понимать,
     нужно ли звать человека, без хрупкого поиска ключевых слов в тексте.
@@ -1134,6 +1137,12 @@ def call_qwen_api(message_text, student_id, history=None, global_dates_text="", 
         "ссылки НЕТ - сам её не придумывай, зови человека (см. раздел \"когда звать "
         "человека\"). Ссылку на оплату "
         "заказа, который ещё не оплачен вообще (created/checkoutData), тоже не выдумывай.\n"
+        "\n\n=== ТЕКУЩИЙ EMAIL СТУДЕНТА ===\n"
+        "Если студент спрашивает, какая у него сейчас почта/на какой email он "
+        "регистрировался - НЕ говори, что не видишь её и НЕ отправляй проверять письмо "
+        "с доступом. В конце этого сообщения (после истории переписки) будет отдельный "
+        "блок \"EMAIL ЭТОГО СТУДЕНТА ПРЯМО СЕЙЧАС\" с точным текущим значением - отвечай "
+        "по нему.\n"
         "\n\n=== СМЕНА EMAIL ===\n"
         "Ровно два варианта, третьего нет:\n"
         "1) Студент написал НОВЫЙ АДРЕС ПОЛНОСТЬЮ, похожий на настоящий email (вида "
@@ -1258,8 +1267,22 @@ def call_qwen_api(message_text, student_id, history=None, global_dates_text="", 
         "выше, ПРАВ ЭТОТ БЛОК, а не история."
     )
 
+    email_reminder = (
+        "=== EMAIL ЭТОГО СТУДЕНТА ПРЯМО СЕЙЧАС ===\n"
+        + (
+            f"Текущий email в CRM: {student_email}"
+            if student_email
+            else "Email этого студента сейчас определить не удалось (нет данных)."
+        ) +
+        "\n\nЕсли студент спрашивает \"какая у меня почта\"/\"на какой email я "
+        "регистрировался\" и т.п. - отвечай ПРЯМО этим значением, не говори, что не "
+        "видишь почту и не отправляй проверять письмо при оформлении заказа - у тебя "
+        "есть точный ответ. Если значения нет (см. выше) - тогда честно скажи, что не "
+        "смог определить, и предложи уточнить у специалиста."
+    )
+
     user_message_with_context = (
-        catalog_reminder + "\n\n" + access_reminder + "\n\n" + orders_reminder +
+        catalog_reminder + "\n\n" + access_reminder + "\n\n" + orders_reminder + "\n\n" + email_reminder +
         "\n\n=== СООБЩЕНИЕ СТУДЕНТА ===\n" + message_text
     )
 
@@ -1477,6 +1500,20 @@ def extract_conversation_id(items, student_id):
     return None
 
 
+def extract_student_email(items, student_id):
+    """
+    Текущий email студента без лишнего вызова API - он уже есть внутри каждого
+    сообщения студента в recent_items (user.contact.email), которые и так запрашиваются
+    для истории переписки/conversationId. Берём email из самого свежего сообщения
+    этого студента.
+    """
+    for item in items:
+        contact = (item.get("user") or {}).get("contact") or {}
+        if contact.get("id") == student_id and contact.get("email"):
+            return contact["email"]
+    return None
+
+
 def build_conversation_history(items, student_id, current_message_text, max_messages):
     """
     Превращает последние сообщения канала в список [{"role", "content"}] для Qwen -
@@ -1655,11 +1692,15 @@ def webhook():
     )
     print(f"DEBUG: Conversation history ({len(conversation_history)} messages): {conversation_history}")
 
+    student_email = extract_student_email(recent_items, student_id)
+    print(f"DEBUG: Student email (from recent messages): {student_email}")
+
     # 1. Получаем ответ от Qwen (с учётом общей базы знаний школы, доступа этого студента
     # и истории последних сообщений диалога)
     print(f"DEBUG: Calling Qwen with: '{message_text[:80]}...'")
     ai_response, needs_human = call_qwen_api(
-        message_text, student_id, conversation_history, global_dates_text, current_price_text
+        message_text, student_id, conversation_history, global_dates_text, current_price_text,
+        student_email
     )
     print(f"DEBUG: AI response: '{ai_response[:80]}...' needs_human={needs_human}")
 
