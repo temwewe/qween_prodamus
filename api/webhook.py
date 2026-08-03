@@ -15,6 +15,24 @@ QWEN_API_KEY = os.getenv("QWEN_API_KEY")
 PRODAMUS_BASE_URL = "https://api.xl.ru/api/v1"
 QWEN_API_URL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions"
 
+# У каждого конкретного model code в DashScope Model Studio - своя ОТДЕЛЬНАЯ бесплатная
+# квота токенов (подтверждено на практике 2026-08-03: у алиаса "qwen-plus" квота
+# закончилась - 403 Forbidden/AllocationQuota.FreeTierOnly - а у датированных снапшотов
+# той же модели квота была нетронута). Пробуем модели по очереди, переходя к следующей
+# ТОЛЬКО при 403 (не при таймауте/сетевой ошибке - это не помогло бы и заняло бы лишнее
+# время). Когда квота текущей первой модели в списке закончится - проверить оставшийся
+# лимит в Model Studio Console → Free Quota и добавить/поднять повыше свежий снапшот.
+QWEN_MODEL_CANDIDATES = [
+    "qwen-plus-2025-07-28",
+    "qwen-plus-2025-07-14",
+    "qwen-plus-2025-04-28",
+]
+
+# Троттлинг Telegram-алерта о сбое Qwen (см. _alert_qwen_failure) - не чаще раза в
+# столько секунд, чтобы вспышка сбоев на разных сообщениях не заспамила уведомлениями.
+QWEN_FAILURE_ALERT_COOLDOWN_SECONDS = int(os.getenv("QWEN_FAILURE_ALERT_COOLDOWN_SECONDS", "900"))
+_last_qwen_failure_alert = {"time": 0.0}
+
 # Telegram-уведомления, когда нужен человек.
 # TELEGRAM_CHAT_IDS - список ID через запятую, например: "111111111,222222222"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -1105,6 +1123,32 @@ def build_student_orders_text(student_id):
     return "\n".join(lines), valid_links
 
 
+def _alert_qwen_failure(error_text):
+    """
+    Уведомляет владельца в Telegram при полном сбое вызова Qwen (все модели из
+    QWEN_MODEL_CANDIDATES не ответили). Подтверждено на практике 2026-08-03: раньше
+    такой сбой (например, исчерпание бесплатной квоты) оставался незамеченным -
+    бот молча отвечал всем студентам "не могу ответить", пока кто-то вручную не
+    проверил логи. Троттлинг через cooldown, а не подсчёт "N подряд ошибок" -
+    в serverless-окружении процесс не переживает между вызовами надёжно, чтобы
+    что-то подряд считать, а cooldown на практике даёт тот же результат: один
+    алерт на вспышку сбоев, а не спам на каждое сообщение студента.
+    """
+    now = time.time()
+    if now - _last_qwen_failure_alert["time"] < QWEN_FAILURE_ALERT_COOLDOWN_SECONDS:
+        return
+    _last_qwen_failure_alert["time"] = now
+    send_telegram_notification(
+        "🔴 Qwen API не отвечает ни на одной из моделей\n\n"
+        f"Ошибка: {error_text}\n\n"
+        "Возможные причины: закончилась бесплатная квота у ВСЕХ моделей из списка "
+        "(проверить Model Studio Console → Free Quota и добавить свежий снапшот в "
+        "QWEN_MODEL_CANDIDATES), невалидный ключ, сбой сервиса DashScope. Пока это "
+        "не починится, бот всем студентам отвечает \"не могу ответить\" и зовёт "
+        "человека."
+    )
+
+
 def call_qwen_api(message_text, student_id, history=None, global_dates_text="", current_price_text="",
                    student_email=None):
     """
@@ -1339,13 +1383,6 @@ def call_qwen_api(message_text, student_id, history=None, global_dates_text="", 
     )
 
     payload = {
-        # Зафиксированный снапшот вместо "плавающего" алиаса "qwen-plus" - у алиаса
-        # закончилась отдельная бесплатная квота на этот биллинг-цикл (403 Forbidden,
-        # AllocationQuota.FreeTierOnly), а у датированных снапшотов той же модели
-        # квота считается отдельно и пока не тронута (см. Model Studio Console -
-        # Free Quota). При следующем исчерпании квоты проверить консоль и обновить
-        # дату снапшота на другой с полным лимитом.
-        "model": "qwen-plus-2025-07-28",
         "messages": (
             [{"role": "system", "content": system_prompt}]
             + (history or [])
@@ -1359,16 +1396,33 @@ def call_qwen_api(message_text, student_id, history=None, global_dates_text="", 
     }
 
     try:
-        response = requests.post(
-            QWEN_API_URL,
-            headers={"Authorization": f"Bearer {QWEN_API_KEY}", "Content-Type": "application/json"},
-            json=payload,
-            timeout=30
-        )
-        print(f"DEBUG: Qwen status={response.status_code}")
-        response.raise_for_status()
+        response = None
+        last_error = None
+        headers = {"Authorization": f"Bearer {QWEN_API_KEY}", "Content-Type": "application/json"}
+
+        for model_name in QWEN_MODEL_CANDIDATES:
+            payload["model"] = model_name
+            resp = requests.post(QWEN_API_URL, headers=headers, json=payload, timeout=30)
+            print(f"DEBUG: Qwen status={resp.status_code} (model={model_name})")
+
+            if resp.status_code == 403:
+                # У этой конкретной модели закончилась её отдельная бесплатная квота -
+                # переходим к следующему снапшоту из списка (не при других ошибках,
+                # чтобы не тратить время на заведомо неудачные повторы при сетевом
+                # сбое/таймауте - там следующая модель, скорее всего, тоже не поможет).
+                last_error = f"403 Forbidden for model={model_name} (probably quota exhausted)"
+                print(f"WARNING: {last_error} - trying next model candidate")
+                continue
+
+            resp.raise_for_status()
+            response = resp
+            break
+
+        if response is None:
+            raise RuntimeError(last_error or "All QWEN_MODEL_CANDIDATES returned 403")
+
         raw_text = response.json()["choices"][0]["message"]["content"]
-        print(f"DEBUG: Qwen raw answer: {raw_text[:200]}")
+        print(f"DEBUG: Qwen raw answer (model={model_name}): {raw_text}")
 
         # На случай, если модель всё же обернёт JSON в ```json ... ```
         cleaned = raw_text.strip()
@@ -1500,6 +1554,7 @@ def call_qwen_api(message_text, student_id, history=None, global_dates_text="", 
         return raw_text if 'raw_text' in dir() else "Извините, сейчас я не могу ответить. Попробуйте позже.", True
     except Exception as e:
         print(f"ERROR: Qwen failed: {e}")
+        _alert_qwen_failure(str(e))
         return "Извините, сейчас я не могу ответить. Попробуйте позже.", True
 
 
