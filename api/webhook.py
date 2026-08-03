@@ -784,15 +784,29 @@ PURCHASE_SCENARIOS = {
     "spleen": "fwd7kublYEuiWO-I4dnDQw",  # Селезёнка — забытый остров
 }
 
+# Сценарий связывания аккаунтов: когда студент присылает боту email, который уже
+# занят ДРУГИМ контактом в Prodamus - это в норме тот же человек (Telegram-контакт
+# без email + более старый контакт с этим email без Telegram), подтверждено
+# владельцем школы. Сценарий сам находит и связывает их по email - вместо того,
+# чтобы вручную перезаписывать email через PUT /crm/lead (это и раньше падало с
+# ошибкой emailAlreadyExists) или отправлять студента вручную набирать /start.
+LINK_ACCOUNT_BY_EMAIL_SCENARIO_ID = "amtA-LEKJkKa7w5OEnGQkA"
 
-def run_scenario(scenario_id, contact_id):
-    """POST /api/v1/scenario/run - запускает сценарий Prodamus для существующего контакта."""
+
+def run_scenario(scenario_id, contact_id, contact_data=None):
+    """POST /api/v1/scenario/run - запускает сценарий Prodamus для существующего контакта.
+
+    contact_data - опциональный словарь для поля "contactData" запроса (например,
+    email, по которому сценарий должен найти/связать аккаунт).
+    """
     url = f"{PRODAMUS_BASE_URL}/scenario/run"
     headers = {
         "Authorization": f"Bearer {PRODAMUS_API_KEY}",
         "Content-Type": "application/json"
     }
     payload = {"scenarioId": scenario_id, "contactId": contact_id}
+    if contact_data:
+        payload["contactData"] = contact_data
 
     try:
         response = requests.post(url, headers=headers, json=payload, timeout=15)
@@ -1399,16 +1413,32 @@ def call_qwen_api(message_text, student_id, history=None, global_dates_text="", 
                     # Это НЕ чужой аккаунт - в норме это тот же студент: Prodamus уже
                     # создал контакт с этим email отдельно (например, при регистрации
                     # на сайте), а Telegram привязан к другому, пустому по email
-                    # контакту. Правильное решение - связать их через штатный сценарий
-                    # бота (/start -> вход в существующий аккаунт), а не считать это
-                    # ошибкой и не звать человека - подтверждено владельцем школы.
-                    reply = (
-                        f"Похоже, у вас уже есть аккаунт школы с почтой {requested_email} — просто "
-                        "он ещё не связан с этим Telegram. Напишите здесь в чате /start и выберите "
-                        "вариант входа в уже существующий аккаунт (не регистрацию) — это свяжет "
-                        "Telegram с вашим аккаунтом автоматически."
+                    # контакту. Правильное решение - запустить штатный сценарий
+                    # связывания аккаунтов по email, а не считать это ошибкой и не
+                    # звать человека - подтверждено владельцем школы.
+                    link_success = run_scenario(
+                        LINK_ACCOUNT_BY_EMAIL_SCENARIO_ID, student_id,
+                        contact_data={"email": requested_email}
                     )
-                    needs_human = False
+                    if link_success:
+                        reply = (
+                            f"Готово, связал этот Telegram с вашим существующим аккаунтом школы "
+                            f"на почту {requested_email}. Доступ и данные теперь должны отображаться "
+                            "корректно."
+                        )
+                        needs_human = False
+                        send_telegram_notification(
+                            "🔗 Бот связал Telegram-контакт с существующим аккаунтом по email\n\n"
+                            f"ID студента: {student_id}\n"
+                            f"Email: {requested_email}"
+                        )
+                    else:
+                        reply = (
+                            f"У вас уже есть аккаунт школы с почтой {requested_email}, но связать "
+                            "его с этим Telegram автоматически не получилось — сейчас передам это "
+                            "специалисту."
+                        )
+                        needs_human = True
                 else:
                     reply = "Не получилось автоматически поменять почту — сейчас передам это специалисту."
                     needs_human = True
