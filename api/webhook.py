@@ -721,11 +721,18 @@ def update_student_email(student_id, new_email):
     (read-merge-write), чтобы не потерять остальные поля - тот же паттерн, что и в
     add_ai_paused_tag.
 
-    Возвращает (success: bool, contact: dict | None, old_email: str | None).
+    Возвращает (success: bool, contact: dict | None, old_email: str | None, error_type: str | None).
+
+    ВАЖНО: Prodamus может ответить HTTP 200 с телом {"success": false, "errors": [...]}
+    (например, error code 16 "emailAlreadyExists", если такой email уже занят другим
+    контактом) - HTTP-статус 200 сам по себе НЕ значит, что обновление реально
+    произошло. Раньше это не проверялось, из-за чего бот докладывал студенту "готово,
+    email обновлён", хотя Prodamus обновление отклонил, и на следующем сообщении
+    email в CRM снова оказывался пустым - подтверждено на практике.
     """
     contact = fetch_full_contact(student_id)
     if contact is None:
-        return False, None, None
+        return False, None, None, None
 
     old_email = contact.get("email")
 
@@ -749,10 +756,17 @@ def update_student_email(student_id, new_email):
         response = requests.put(url, headers=headers, json=updated_contact, timeout=10)
         print(f"DEBUG: Update contact (change email) status={response.status_code}")
         print(f"DEBUG: Update contact body: {response.text[:500]}")
-        return response.status_code == 200, contact, old_email
+        if response.status_code != 200:
+            return False, contact, old_email, None
+
+        data = response.json()
+        if not data.get("success"):
+            error_type = ((data.get("errors") or [{}])[0]).get("type")
+            return False, contact, old_email, error_type
+        return True, contact, old_email, None
     except Exception as e:
         print(f"ERROR: Failed to update contact email: {e}")
-        return False, contact, old_email
+        return False, contact, old_email, None
 
 
 # Сценарии Prodamus, которые бот умеет запускать для оформления заказа/оплаты
@@ -1367,7 +1381,7 @@ def call_qwen_api(message_text, student_id, history=None, global_dates_text="", 
                 )
                 needs_human = False
             else:
-                success, contact, old_email = update_student_email(student_id, requested_email)
+                success, contact, old_email, error_type = update_student_email(student_id, requested_email)
                 if success:
                     reply = (
                         f"Готово, обновил почту на {requested_email}. "
@@ -1381,6 +1395,13 @@ def call_qwen_api(message_text, student_id, history=None, global_dates_text="", 
                         f"Старый email: {old_email or 'неизвестно'}\n"
                         f"Новый email: {requested_email}"
                     )
+                elif error_type == "emailAlreadyExists":
+                    reply = (
+                        f"Этот email ({requested_email}) уже привязан к другому аккаунту в нашей "
+                        "системе, поэтому автоматически поменять не получится — сейчас передам "
+                        "это специалисту, он разберётся."
+                    )
+                    needs_human = True
                 else:
                     reply = "Не получилось автоматически поменять почту — сейчас передам это специалисту."
                     needs_human = True
