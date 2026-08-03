@@ -1287,7 +1287,13 @@ def call_qwen_api(message_text, student_id, history=None, global_dates_text="", 
     )
 
     payload = {
-        "model": "qwen-plus",
+        # Зафиксированный снапшот вместо "плавающего" алиаса "qwen-plus" - у алиаса
+        # закончилась отдельная бесплатная квота на этот биллинг-цикл (403 Forbidden,
+        # AllocationQuota.FreeTierOnly), а у датированных снапшотов той же модели
+        # квота считается отдельно и пока не тронута (см. Model Studio Console -
+        # Free Quota). При следующем исчерпании квоты проверить консоль и обновить
+        # дату снапшота на другой с полным лимитом.
+        "model": "qwen-plus-2025-07-28",
         "messages": (
             [{"role": "system", "content": system_prompt}]
             + (history or [])
