@@ -833,50 +833,13 @@ def fetch_full_contact(student_id):
         return None
 
 
-def add_ai_paused_tag(contact, known_current_tags=None):
-    """
-    Добавляем тег AI_PAUSED_TAG и отправляем ВЕСЬ объект контакта обратно через PUT
-    (read-merge-write), чтобы не затереть остальные поля контакта.
-
-    ВАЖНО: GET /crm/lead/{id} на стороне Prodamus иногда возвращает ПУСТОЙ список tags,
-    даже если у контакта реально есть теги (подтверждено логами - тот же контакт в тот же
-    момент показывает теги через макрос #Contact.Tags# в сценарии, но не через этот API).
-    Поэтому если known_current_tags передан (например, теги из тела вебхука через
-    #Contact.Tags#) - используем ИХ как источник правды, а не contact["tags"] из GET.
-    """
-
-    if not contact:
-        return False
-
-    if known_current_tags is not None:
-        tags = list(known_current_tags)
-    else:
-        tags = list(contact.get("tags") or [])
-
-    if AI_PAUSED_TAG not in tags:
-        tags.append(AI_PAUSED_TAG)
-
-    # Эта модель API использует Optional<T> для полей-коллекций - сервер требует
-    # обёртку {"value": [...]}, а не голый JSON-массив (иначе 400 invalidModel).
-    updated_contact = dict(contact)
-    updated_contact["tags"] = {"value": tags}
-    if "groups" in updated_contact:
-        updated_contact["groups"] = {"value": updated_contact.get("groups") or []}
-
-    url = f"{PRODAMUS_BASE_URL}/crm/lead"
-    headers = {
-        "Authorization": f"Bearer {PRODAMUS_API_KEY}",
-        "Content-Type": "application/json"
-    }
-
-    try:
-        response = requests.put(url, headers=headers, json=updated_contact, timeout=10)
-        print(f"DEBUG: Update contact (add tag) status={response.status_code}")
-        print(f"DEBUG: Update contact body: {response.text[:500]}")
-        return response.status_code == 200
-    except Exception as e:
-        print(f"ERROR: Failed to update contact tags: {e}")
-        return False
+# pause_ai_for_contact() живёт рядом с run_scenario()/ASK_HUMAN_SCENARIO_ID ниже -
+# раньше здесь был add_ai_paused_tag() (read-merge-write через PUT /crm/lead), но он
+# дважды подряд (2026-08-06/07) затирал реальные теги контакта, потому что и
+# webhook-macro #Contact.Tags#, и живой GET /crm/lead независимо друг от друга
+# оказались ненадёжны (иногда оба одновременно врут, что тегов нет). Заменено на
+# запуск сценария Prodamus с действием "Добавить теги" - оно добавляет тег атомарно
+# на стороне Prodamus, без чтения/перезаписи всего списка в нашем коде.
 
 
 def send_telegram_notification(text):
@@ -1038,6 +1001,18 @@ LINK_ACCOUNT_BY_EMAIL_SCENARIO_ID = "amtA-LEKJkKa7w5OEnGQkA"
 # происходит только когда студент реально нажимает кнопку - тогда сценарий шлёт
 # веб-хук обратно на этот же URL с полем confirmHuman=true (см. обработку в webhook()).
 ASK_HUMAN_SCENARIO_ID = "Y6Ks22RSKU22GMJY8keX5w"
+
+# Сценарий "Добавить тег ai_paused" (2026-08-07): событие "Начат сценарий" + действие
+# "Добавить теги" (тег ai_paused). Заменяет прежний read-merge-write через
+# PUT /crm/lead (add_ai_paused_tag) - тот дважды затирал реальные теги контакта из-за
+# ненадёжного GET/webhook-macro (см. CHANGES.md).
+ADD_AI_PAUSED_TAG_SCENARIO_ID = "GqO0oD-t90Wxkv2_MWVm3Q"
+
+
+def pause_ai_for_contact(student_id):
+    """Ставит тег AI_PAUSED_TAG через сценарий Prodamus - см. комментарий у
+    ADD_AI_PAUSED_TAG_SCENARIO_ID."""
+    return run_scenario(ADD_AI_PAUSED_TAG_SCENARIO_ID, student_id)
 
 
 def run_scenario(scenario_id, contact_id, contact_data=None):
@@ -2181,16 +2156,7 @@ def webhook():
             if item_contact.get("id") == student_id and (item.get("text") or "").strip():
                 last_student_text = item["text"].strip()
                 break
-        # ВАЖНО (баг найден 2026-08-06, тот же вечер, что и баг в update_student_email):
-        # URL кнопки/веб-хука "Позвать специалиста" НЕ передаёт tags вообще (нет
-        # параметра tags/Tags в query) - значит tags_from_webhook тут ВСЕГДА пустой
-        # список, а не "иногда пустой из-за глюка", как для обычных сообщений. Если
-        # передать его как known_current_tags как есть, add_ai_paused_tag каждый раз
-        # стирает реальные теги контакта на один только ai_paused - подтверждено на
-        # практике (Предзапись Щитовидка/Селезенка/ЛАП снесены именно так). Поэтому
-        # здесь передаём None при пустом tags_from_webhook, чтобы add_ai_paused_tag
-        # использовал contact.get("tags") из свежего GET вместо заведомо неверного [].
-        add_ai_paused_tag(contact, known_current_tags=(tags_from_webhook or None))
+        pause_ai_for_contact(student_id)
         notify_human(
             contact, student_id, last_student_text,
             "[Студент нажал кнопку \"Позвать специалиста\"]"
@@ -2275,15 +2241,13 @@ def webhook():
     print(f"DEBUG: AI response: '{ai_response[:80]}...' needs_human={needs_human} offer_human={offer_human}")
 
     # 1.5 needs_human = студент САМ уже подтвердил (в этом сообщении), что зовёт человека -
-    # эскалируем немедленно: читаем контакт через API (email/имя + база для read-merge-write),
-    # ставим тег паузы и уведомляем в Telegram. Контакт читаем только сейчас, а не для
-    # каждого сообщения - экономим вызовы API в обычном случае.
+    # эскалируем немедленно: читаем контакт через API (email/имя для notify_human),
+    # ставим тег паузы через сценарий (pause_ai_for_contact) и уведомляем в Telegram.
+    # Контакт читаем только сейчас, а не для каждого сообщения - экономим вызовы API
+    # в обычном случае.
     if needs_human:
         contact = fetch_full_contact(student_id)
-        # Пустой tags_from_webhook здесь обычно значит устаревший/глючный снимок
-        # макроса (см. комментарий в ветке confirmHuman выше) - не передаём [] как
-        # "тегов нет по-настоящему", даём add_ai_paused_tag упасть на GET-снимок.
-        add_ai_paused_tag(contact, known_current_tags=(tags_from_webhook or None))
+        pause_ai_for_contact(student_id)
         notify_human(contact, student_id, message_text, ai_response)
     elif offer_human:
         # Подтверждения от студента ещё не было - НЕ ставим паузу и НЕ уведомляем
