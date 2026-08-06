@@ -690,10 +690,13 @@ SCHOOL_INFO_OUTRO = """
 О: Нужно вернуться на шаг "Инструкция по работе с платформой" в структуре курса — там есть
    переход в чат обсуждения.
 
-=== КОГДА ОБЯЗАТЕЛЬНО ЗВАТЬ ЧЕЛОВЕКА (не пытаться решить самостоятельно) ===
+=== КОГДА ПРЕДЛОЖИТЬ ПОЗВАТЬ СПЕЦИАЛИСТА (offerHuman, не пытаться решить
+    самостоятельно) ===
+Везде в этом разделе речь про offerHuman, а не needs_human - разница между ними
+объясняется в разделе "КОГДА СТАВИТЬ needs_human, А КОГДА offerHuman" ниже.
 - Доступ/оплата, где студент УЖЕ попробовал предложенные варианты (проверить
   почту, другой способ оплаты и т.п.) и они НЕ помогли - если у тебя есть полный
-  готовый ответ из FAQ/раздела "ОПЛАТА" на ПЕРВОЕ обращение по теме, needs_human
+  готовый ответ из FAQ/раздела "ОПЛАТА" на ПЕРВОЕ обращение по теме, offerHuman
   ставить НЕ нужно, просто дай этот ответ. Эскалация - только когда стандартный
   совет уже дан (в истории переписки) и не сработал, или готового ответа в базе
   знаний нет вообще.
@@ -723,7 +726,7 @@ SCHOOL_INFO_OUTRO = """
 общеизвестными - ты не можешь проверить их точность, а цена ошибки для
 практикующего врача высокая. В любом таком случае: вежливо объясни, что это
 разбирается внутри самого курса (если тема там есть - назови её), а конкретные
-медицинские детали ты дать не можешь, needs_human=true.
+медицинские детали ты дать не можешь, offerHuman=true.
 
 === ЮРИДИЧЕСКИЕ/РЕГИСТРАЦИОННЫЕ ДАННЫЕ ШКОЛЫ - ОСОБОЕ ПРАВИЛО (проверено на
     практике, подтверждённая реальная проблема - модель до этой инструкции
@@ -733,11 +736,28 @@ SCHOOL_INFO_OUTRO = """
 а в этом сообщении (в блоках ниже) такие данные НЕ переданы явно - НЕ придумывай
 их, даже правдоподобно звучащие. Это реальные официальные данные, ошибка в них
 может создать юридические проблемы школе. Честно скажи, что для точных реквизитов
-нужно обратиться к специалисту, needs_human=true.
+нужно обратиться к специалисту, offerHuman=true.
 
-Если нужно позвать человека — не придумывай ответ сам. Вежливо сообщи студенту, что
-не можешь ответить на этот конкретный вопрос и уже передал обращение специалисту,
-который скоро свяжется.
+=== КОГДА СТАВИТЬ needs_human, А КОГДА offerHuman ===
+Это два РАЗНЫХ флага, не путай их:
+- offerHuman=true - ты не можешь уверенно ответить сам (см. случаи выше) или
+  студенту нужно то, что ты не можешь сделать автоматически. В reply НЕ пиши,
+  что уже передал обращение специалисту - ты ЕЩЁ НЕ передал. Вежливо объясни,
+  что конкретно не можешь сказать/сделать сам, и что ниже появится кнопка -
+  студент сам решит, звать специалиста или нет. Саму кнопку показывает код,
+  тебе не нужно её описывать подробно, рисовать текстом или выдумывать её вид -
+  просто закончи ответ фразой в духе "Если нужно, нажмите кнопку ниже, чтобы я
+  передал вопрос специалисту".
+- needs_human=true - используй ТОЛЬКО когда студент В ЭТОМ САМОМ сообщении САМ
+  явно и однозначно просит позвать человека/специалиста/менеджера/оператора
+  ("позовите специалиста", "хочу поговорить с человеком", "переключите на
+  оператора" и т.п.) - подтверждение уже получено от самого студента, эскалировать
+  можно сразу, без дополнительного вопроса и без кнопки. Во ВСЕХ остальных
+  случаях, включая все случаи из разделов выше, needs_human ОБЯЗАТЕЛЬНО false -
+  вызывать человека без явного подтверждения студента НЕЛЬЗЯ, только предлагать
+  через offerHuman.
+- Никогда не ставь оба флага true одновременно - если студент уже явно
+  подтвердил, что зовёт человека, достаточно needs_human.
 """
 
 
@@ -990,6 +1010,15 @@ PURCHASE_SCENARIOS = {
 # чтобы вручную перезаписывать email через PUT /crm/lead (это и раньше падало с
 # ошибкой emailAlreadyExists) или отправлять студента вручную набирать /start.
 LINK_ACCOUNT_BY_EMAIL_SCENARIO_ID = "amtA-LEKJkKa7w5OEnGQkA"
+
+# Сценарий "Позвать специалиста": запускается кодом, когда бот не может уверенно
+# ответить сам (offer_human=True из call_qwen_api), но студент ЕЩЁ НЕ подтвердил,
+# что хочет звать человека. Сам сценарий шлёт отдельным сообщением кнопку
+# "Позвать специалиста" - код НЕ ставит паузу и НЕ уведомляет специалиста на этом
+# шаге. Реальная эскалация (тег ai_paused + уведомление в Telegram, см. notify_human)
+# происходит только когда студент реально нажимает кнопку - тогда сценарий шлёт
+# веб-хук обратно на этот же URL с полем confirmHuman=true (см. обработку в webhook()).
+ASK_HUMAN_SCENARIO_ID = "Y6Ks22RSKU22GMJY8keX5w"
 
 
 def run_scenario(scenario_id, contact_id, contact_data=None):
@@ -1349,7 +1378,12 @@ def _alert_qwen_failure(error_text):
 def call_qwen_api(message_text, student_id, history=None, global_dates_text="", current_price_text="",
                    student_email=None):
     """
-    Возвращает (reply_text, needs_human).
+    Возвращает (reply_text, needs_human, offer_human).
+    needs_human=True - студент САМ явно подтвердил, что зовёт человека прямо сейчас
+    (в этом сообщении или нажатием кнопки) - код должен эскалировать немедленно.
+    offer_human=True - бот не может ответить уверенно сам, но подтверждения от
+    студента ещё не было - код должен предложить кнопку "Позвать специалиста"
+    через отдельный сценарий Prodamus, а не эскалировать сразу.
 
     history - список предыдущих сообщений диалога [{"role": "user"/"assistant", "content": "..."}]
     в хронологическом порядке (без текущего сообщения) - даёт модели минимальную память
@@ -1483,17 +1517,18 @@ def call_qwen_api(message_text, student_id, history=None, global_dates_text="", 
         "чуть выше в этом же чате, НЕ говори проверять почту (это про другой сценарий - "
         "проверку почты после уже завершённой оплаты, а не про эту кнопку). Если студент "
         "говорит, что кнопка/ссылка так и не появилась - НЕ придумывай причину, поставь "
-        "needs_human=true и передай специалисту.\n"
+        "offerHuman=true.\n"
         "\n\n=== ФОРМАТ ОТВЕТА ===\n"
         "Весь твой ответ целиком - СТРОГО валидный JSON-объект, без ```-обёртки вокруг него "
         "и без пояснений до/после него, вот так (звёздочки и \"- \" ВНУТРИ значения reply "
         "по правилам оформления выше - это нормально, речь только про сам JSON снаружи):\n"
         '{"reply": "текст ответа для студента", "needs_human": true или false, '
+        '"offerHuman": true или false, '
         '"requestedEmailChange": "новый@адрес.ru или null", '
         '"requestedPurchase": "ultrasound_friends / thyroid / lymph_nodes / lap / spleen / null"}\n\n'
-        "needs_human = true, если вопрос попадает в раздел \"когда обязательно звать человека\" "
-        "или если ты не можешь уверенно ответить на основе базы знаний.\n"
-        "needs_human = false, если ты полностью и уверенно ответил на основе базы знаний.\n"
+        "needs_human и offerHuman - РАЗНЫЕ флаги, см. раздел \"КОГДА СТАВИТЬ needs_human, "
+        "А КОГДА offerHuman\" выше по инструкции - не путай их и не ставь оба true одновременно "
+        "(если студент уже явно подтвердил, что зовёт человека - только needs_human).\n"
         "requestedEmailChange = null, если студент не просил сменить email в этом сообщении.\n"
         "requestedPurchase = null, если студент не просил оформить заказ ни на один из "
         "продуктов из списка выше."
@@ -1659,12 +1694,14 @@ def call_qwen_api(message_text, student_id, history=None, global_dates_text="", 
         parsed = json.loads(cleaned)
         reply = parsed.get("reply", "Извините, произошла ошибка. Попробуйте позже.")
         needs_human = bool(parsed.get("needs_human", False))
+        offer_human = bool(parsed.get("offerHuman", False))
         requested_email = parsed.get("requestedEmailChange")
         requested_purchase = parsed.get("requestedPurchase")
 
         print(
             f"DEBUG: Parsed reply='{reply[:80]}...' needs_human={needs_human} "
-            f"requestedEmailChange={requested_email} requestedPurchase={requested_purchase}"
+            f"offer_human={offer_human} requestedEmailChange={requested_email} "
+            f"requestedPurchase={requested_purchase}"
         )
 
         # Саму смену email и текст итогового ответа формируем в коде, а не доверяем модели -
@@ -1718,13 +1755,16 @@ def call_qwen_api(message_text, student_id, history=None, global_dates_text="", 
                     else:
                         reply = (
                             f"У вас уже есть аккаунт школы с почтой {requested_email}, но связать "
-                            "его с этим Telegram автоматически не получилось — сейчас передам это "
-                            "специалисту."
+                            "его с этим Telegram автоматически не получилось. Если нужно, нажмите "
+                            "кнопку ниже, чтобы я передал это специалисту."
                         )
-                        needs_human = True
+                        offer_human = True
                 else:
-                    reply = "Не получилось автоматически поменять почту — сейчас передам это специалисту."
-                    needs_human = True
+                    reply = (
+                        "Не получилось автоматически поменять почту. Если нужно, нажмите кнопку "
+                        "ниже, чтобы я передал это специалисту."
+                    )
+                    offer_human = True
 
         # Саму покупку и текст итогового ответа формируем в коде, а не доверяем модели -
         # запуск сценария Prodamus создаёт заказ и сам присылает ссылку на оплату
@@ -1744,8 +1784,11 @@ def call_qwen_api(message_text, student_id, history=None, global_dates_text="", 
                 scenario_id = PURCHASE_SCENARIOS.get(requested_purchase)
                 if not scenario_id:
                     print(f"WARNING: Unknown requestedPurchase key from model: {requested_purchase}")
-                    reply = "Не могу оформить этот заказ автоматически — сейчас передам это специалисту."
-                    needs_human = True
+                    reply = (
+                        "Не могу оформить этот заказ автоматически. Если нужно, нажмите кнопку "
+                        "ниже, чтобы я передал это специалисту."
+                    )
+                    offer_human = True
                 else:
                     success = run_scenario(scenario_id, student_id)
                     if success:
@@ -1763,9 +1806,10 @@ def call_qwen_api(message_text, student_id, history=None, global_dates_text="", 
                     else:
                         reply = (
                             "Сейчас не получилось оформить заказ автоматически (возможно, продажа "
-                            "этого продукта сейчас закрыта) — передаю специалисту."
+                            "этого продукта сейчас закрыта). Если нужно, нажмите кнопку ниже, чтобы "
+                            "я передал это специалисту."
                         )
-                        needs_human = True
+                        offer_human = True
 
         # Модель может сама выдумать правдоподобную ссылку на оплату вместо честного
         # "не знаю" - подтверждено на практике (сфабриковала несуществующую ссылку на
@@ -1776,22 +1820,44 @@ def call_qwen_api(message_text, student_id, history=None, global_dates_text="", 
         sanitized_reply = _sanitize_reply_payment_links(reply, valid_payment_links)
         if sanitized_reply is None:
             print(f"WARNING: Blocked hallucinated/unverified payment link in reply: {reply[:300]}")
-            reply = "Не могу автоматически сформировать ссылку на оплату — сейчас передам это специалисту."
-            needs_human = True
+            reply = (
+                "Не могу автоматически сформировать ссылку на оплату. Если нужно, нажмите "
+                "кнопку ниже, чтобы я передал это специалисту."
+            )
+            needs_human = False
+            offer_human = True
         else:
             reply = sanitized_reply
 
-        return reply, needs_human
+        # needs_human и offer_human одновременно true не имеет смысла (см. промпт) -
+        # на всякий случай подстраховываемся и в коде, а не только инструкцией.
+        if needs_human:
+            offer_human = False
+
+        return reply, needs_human, offer_human
 
     except json.JSONDecodeError as e:
-        # Если модель вернула не-JSON - используем сырой текст как ответ,
-        # и на всякий случай считаем, что человек может понадобиться
+        # Если модель вернула не-JSON (например, голое число вместо {"reply": ...} -
+        # подтверждённый на практике глюк Qwen) - сырой текст может быть нечитаемым
+        # мусором, показывать его студенту нельзя. Честный нейтральный ответ +
+        # предложение позвать специалиста (не мгновенная эскалация - подтверждения
+        # от студента ещё не было).
         print(f"ERROR: Qwen did not return valid JSON: {e}")
-        return raw_text if 'raw_text' in dir() else "Извините, сейчас я не могу ответить. Попробуйте позже.", True
+        return (
+            "Не получилось точно разобраться с вашим вопросом. Если нужно, нажмите кнопку "
+            "ниже, чтобы я передал это специалисту.",
+            False,
+            True,
+        )
     except Exception as e:
         print(f"ERROR: Qwen failed: {e}")
         _alert_qwen_failure(str(e))
-        return "Извините, сейчас я не могу ответить. Попробуйте позже.", True
+        return (
+            "Извините, сейчас я не могу ответить. Если нужно, нажмите кнопку ниже, чтобы я "
+            "передал это специалисту.",
+            False,
+            True,
+        )
 
 
 CONVERSATION_HISTORY_MESSAGE_COUNT = int(os.getenv("CONVERSATION_HISTORY_MESSAGE_COUNT", "5"))
@@ -2026,6 +2092,29 @@ def webhook():
         print("WARNING: studentId is literal 'null' - looks like a test request, not a real message")
         return jsonify({"status": "ignored", "message": "Test request detected"}), 200
 
+    # Кнопка "Позвать специалиста" (сценарий ASK_HUMAN_SCENARIO_ID, см. константу выше) шлёт
+    # сюда веб-хук с confirmHuman=true вместо обычного сообщения студента - это и есть то самое
+    # подтверждение от студента, которого требует правило "человека зовём только по
+    # подтверждению". Эскалируем сразу (тег паузы + уведомление специалисту), Qwen не вызываем.
+    if data.get("confirmHuman"):
+        print("DEBUG: Human-confirm button clicked by student")
+        contact = fetch_full_contact(student_id)
+        recent_items = fetch_recent_channel_messages(
+            chat_channel_id, student_id, take=CONVERSATION_HISTORY_FETCH_COUNT
+        )
+        last_student_text = "-"
+        for item in recent_items:
+            item_contact = (item.get("user") or {}).get("contact") or {}
+            if item_contact.get("id") == student_id and (item.get("text") or "").strip():
+                last_student_text = item["text"].strip()
+                break
+        add_ai_paused_tag(contact, known_current_tags=tags_from_webhook)
+        notify_human(
+            contact, student_id, last_student_text,
+            "[Студент нажал кнопку \"Позвать специалиста\"]"
+        )
+        return jsonify({"status": "ok", "message": "Human confirmed via button"}), 200
+
     # Проверка паузы: если тег ai_paused виден в теле вебхука (#Contact.Tags#), это ещё
     # не окончательная правда - на практике подтверждено, что после снятия тега вручную
     # в карточке контакта следующие 1-2 вебхука всё равно приходят с этим тегом в макросе
@@ -2097,19 +2186,28 @@ def webhook():
     # 1. Получаем ответ от Qwen (с учётом общей базы знаний школы, доступа этого студента
     # и истории последних сообщений диалога)
     print(f"DEBUG: Calling Qwen with: '{message_text[:80]}...'")
-    ai_response, needs_human = call_qwen_api(
+    ai_response, needs_human, offer_human = call_qwen_api(
         message_text, student_id, conversation_history, global_dates_text, current_price_text,
         student_email
     )
-    print(f"DEBUG: AI response: '{ai_response[:80]}...' needs_human={needs_human}")
+    print(f"DEBUG: AI response: '{ai_response[:80]}...' needs_human={needs_human} offer_human={offer_human}")
 
-    # 1.5 Если нужен человек - читаем контакт через API (email/имя + база для read-merge-write),
+    # 1.5 needs_human = студент САМ уже подтвердил (в этом сообщении), что зовёт человека -
+    # эскалируем немедленно: читаем контакт через API (email/имя + база для read-merge-write),
     # ставим тег паузы и уведомляем в Telegram. Контакт читаем только сейчас, а не для
     # каждого сообщения - экономим вызовы API в обычном случае.
     if needs_human:
         contact = fetch_full_contact(student_id)
         add_ai_paused_tag(contact, known_current_tags=tags_from_webhook)
         notify_human(contact, student_id, message_text, ai_response)
+    elif offer_human:
+        # Подтверждения от студента ещё не было - НЕ ставим паузу и НЕ уведомляем
+        # специалиста сразу, только запускаем сценарий Prodamus, который присылает
+        # отдельным сообщением кнопку "Позвать специалиста". Реальная эскалация
+        # (тег + уведомление) произойдёт только если студент сам нажмёт эту кнопку -
+        # см. обработку data.get("confirmHuman") в начале этого маршрута.
+        scenario_ok = run_scenario(ASK_HUMAN_SCENARIO_ID, student_id)
+        print(f"DEBUG: Ask-human button scenario triggered, success={scenario_ok}")
 
     # 2. Получаем conversationId - из вебхука, а если там макрос/пусто, то из уже
     # полученных recent_items (без повторного вызова API)
