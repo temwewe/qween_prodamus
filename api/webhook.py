@@ -2113,7 +2113,16 @@ def webhook():
             if item_contact.get("id") == student_id and (item.get("text") or "").strip():
                 last_student_text = item["text"].strip()
                 break
-        add_ai_paused_tag(contact, known_current_tags=tags_from_webhook)
+        # ВАЖНО (баг найден 2026-08-06, тот же вечер, что и баг в update_student_email):
+        # URL кнопки/веб-хука "Позвать специалиста" НЕ передаёт tags вообще (нет
+        # параметра tags/Tags в query) - значит tags_from_webhook тут ВСЕГДА пустой
+        # список, а не "иногда пустой из-за глюка", как для обычных сообщений. Если
+        # передать его как known_current_tags как есть, add_ai_paused_tag каждый раз
+        # стирает реальные теги контакта на один только ai_paused - подтверждено на
+        # практике (Предзапись Щитовидка/Селезенка/ЛАП снесены именно так). Поэтому
+        # здесь передаём None при пустом tags_from_webhook, чтобы add_ai_paused_tag
+        # использовал contact.get("tags") из свежего GET вместо заведомо неверного [].
+        add_ai_paused_tag(contact, known_current_tags=(tags_from_webhook or None))
         notify_human(
             contact, student_id, last_student_text,
             "[Студент нажал кнопку \"Позвать специалиста\"]"
@@ -2203,7 +2212,10 @@ def webhook():
     # каждого сообщения - экономим вызовы API в обычном случае.
     if needs_human:
         contact = fetch_full_contact(student_id)
-        add_ai_paused_tag(contact, known_current_tags=tags_from_webhook)
+        # Пустой tags_from_webhook здесь обычно значит устаревший/глючный снимок
+        # макроса (см. комментарий в ветке confirmHuman выше) - не передаём [] как
+        # "тегов нет по-настоящему", даём add_ai_paused_tag упасть на GET-снимок.
+        add_ai_paused_tag(contact, known_current_tags=(tags_from_webhook or None))
         notify_human(contact, student_id, message_text, ai_response)
     elif offer_human:
         # Подтверждения от студента ещё не было - НЕ ставим паузу и НЕ уведомляем
