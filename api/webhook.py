@@ -28,6 +28,20 @@ QWEN_MODEL_CANDIDATES = [
     "qwen3-max",
 ]
 
+# Резервный провайдер (2026-08-07): если Qwen недоступен (квота исчерпана у ВСЕХ
+# моделей из QWEN_MODEL_CANDIDATES, сбой DashScope, таймаут) - пробуем Groq вместо
+# того, чтобы сразу отвечать студенту "не могу ответить". Groq выбран как бесплатный
+# резерв: бессрочный free tier без карты (30 запросов/мин, 14400/день на free-моделях),
+# OpenAI-совместимый эндпоинт (тот же формат запроса/ответа, что и у Qwen выше, включая
+# response_format json_object) - минимум отдельного кода. Активируется только если
+# задан FALLBACK_API_KEY - без него поведение не меняется (просто нет резерва).
+FALLBACK_API_KEY = os.getenv("FALLBACK_API_KEY")
+FALLBACK_API_URL = os.getenv("FALLBACK_API_URL", "https://api.groq.com/openai/v1/chat/completions")
+FALLBACK_MODEL_CANDIDATES = [
+    "openai/gpt-oss-120b",
+    "llama-3.3-70b-versatile",
+]
+
 # Троттлинг Telegram-алерта о сбое Qwen (см. _alert_qwen_failure) - не чаще раза в
 # столько секунд, чтобы вспышка сбоев на разных сообщениях не заспамила уведомлениями.
 QWEN_FAILURE_ALERT_COOLDOWN_SECONDS = int(os.getenv("QWEN_FAILURE_ALERT_COOLDOWN_SECONDS", "900"))
@@ -1380,6 +1394,56 @@ def _alert_qwen_failure(error_text):
     )
 
 
+_last_fallback_used_alert = {"time": 0.0}
+
+
+def _alert_fallback_used(error_text, fallback_model):
+    """
+    Уведомляет владельца, когда Qwen отказал, но резервный провайдер (Groq) успешно
+    ответил вместо него - бот продолжает работать, но это сигнал проверить/пополнить
+    квоту Qwen. Отдельный, более мягкий по тону алерт от _alert_qwen_failure (тот -
+    про полный отказ, когда бот вообще не смог ответить).
+    """
+    now = time.time()
+    if now - _last_fallback_used_alert["time"] < QWEN_FAILURE_ALERT_COOLDOWN_SECONDS:
+        return
+    _last_fallback_used_alert["time"] = now
+    send_telegram_notification(
+        "🟡 Qwen недоступен, ответил резервный провайдер (Groq)\n\n"
+        f"Модель резерва: {fallback_model}\n"
+        f"Ошибка Qwen: {error_text}\n\n"
+        "Бот продолжает отвечать студентам как обычно, но стоит проверить квоту "
+        "Qwen в DashScope Model Studio Console → Free Quota."
+    )
+
+
+def _call_llm_candidates(api_url, api_key, model_candidates, payload):
+    """
+    Пробует по очереди модели из model_candidates на одном OpenAI-совместимом
+    эндпоинте (Qwen/DashScope или резервный Groq - формат запроса идентичен),
+    переходя к следующей ТОЛЬКО при 403 (см. комментарий у QWEN_MODEL_CANDIDATES).
+    Возвращает (сырой текст ответа, имя сработавшей модели) или бросает RuntimeError,
+    если ни одна модель не ответила.
+    """
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    last_error = None
+    for model_name in model_candidates:
+        request_payload = dict(payload)
+        request_payload["model"] = model_name
+        resp = requests.post(api_url, headers=headers, json=request_payload, timeout=30)
+        print(f"DEBUG: LLM status={resp.status_code} (url={api_url}, model={model_name})")
+
+        if resp.status_code == 403:
+            last_error = f"403 Forbidden for model={model_name} (probably quota exhausted)"
+            print(f"WARNING: {last_error} - trying next model candidate")
+            continue
+
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"], model_name
+
+    raise RuntimeError(last_error or f"All model candidates returned 403 for {api_url}")
+
+
 def call_qwen_api(message_text, student_id, history=None, global_dates_text="", current_price_text="",
                    student_email=None):
     """
@@ -1662,33 +1726,24 @@ def call_qwen_api(message_text, student_id, history=None, global_dates_text="", 
     }
 
     try:
-        response = None
-        last_error = None
-        headers = {"Authorization": f"Bearer {QWEN_API_KEY}", "Content-Type": "application/json"}
-
-        for model_name in QWEN_MODEL_CANDIDATES:
-            payload["model"] = model_name
-            resp = requests.post(QWEN_API_URL, headers=headers, json=payload, timeout=30)
-            print(f"DEBUG: Qwen status={resp.status_code} (model={model_name})")
-
-            if resp.status_code == 403:
-                # У этой конкретной модели закончилась её отдельная бесплатная квота -
-                # переходим к следующему снапшоту из списка (не при других ошибках,
-                # чтобы не тратить время на заведомо неудачные повторы при сетевом
-                # сбое/таймауте - там следующая модель, скорее всего, тоже не поможет).
-                last_error = f"403 Forbidden for model={model_name} (probably quota exhausted)"
-                print(f"WARNING: {last_error} - trying next model candidate")
-                continue
-
-            resp.raise_for_status()
-            response = resp
-            break
-
-        if response is None:
-            raise RuntimeError(last_error or "All QWEN_MODEL_CANDIDATES returned 403")
-
-        raw_text = response.json()["choices"][0]["message"]["content"]
-        print(f"DEBUG: Qwen raw answer (model={model_name}): {raw_text}")
+        try:
+            raw_text, model_name = _call_llm_candidates(
+                QWEN_API_URL, QWEN_API_KEY, QWEN_MODEL_CANDIDATES, payload
+            )
+            print(f"DEBUG: Qwen raw answer (model={model_name}): {raw_text}")
+        except Exception as qwen_error:
+            # Qwen отказал на всех моделях (квота/сбой/таймаут) - пробуем резервного
+            # провайдера, если он настроен (FALLBACK_API_KEY), вместо того чтобы сразу
+            # сдаваться и отвечать студенту "не могу ответить" (см. константы вверху
+            # файла). Без настроенного резерва поведение как раньше - просто re-raise.
+            if not FALLBACK_API_KEY:
+                raise
+            print(f"WARNING: Qwen failed ({qwen_error}) - trying fallback provider (Groq)")
+            raw_text, model_name = _call_llm_candidates(
+                FALLBACK_API_URL, FALLBACK_API_KEY, FALLBACK_MODEL_CANDIDATES, payload
+            )
+            print(f"DEBUG: Fallback raw answer (model={model_name}): {raw_text}")
+            _alert_fallback_used(str(qwen_error), model_name)
 
         # На случай, если модель всё же обернёт JSON в ```json ... ```
         cleaned = raw_text.strip()
