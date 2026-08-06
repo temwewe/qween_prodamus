@@ -958,12 +958,17 @@ def update_student_email(student_id, new_email):
     updated_contact = dict(contact)
     updated_contact["email"] = new_email
 
-    # Эта модель API использует Optional<T> для полей-коллекций - сервер требует
-    # обёртку {"value": [...]}, а не голый JSON-массив (иначе 400 invalidModel).
-    if "tags" in updated_contact:
-        updated_contact["tags"] = {"value": updated_contact.get("tags") or []}
-    if "groups" in updated_contact:
-        updated_contact["groups"] = {"value": updated_contact.get("groups") or []}
+    # ВАЖНО (баг найден 2026-08-06): этот путь меняет ТОЛЬКО email, поэтому tags/groups
+    # из payload вообще убираем, а не оборачиваем. GET /crm/lead иногда отдаёт ПУСТОЙ
+    # tags, даже когда у контакта реально есть теги (тот же глюк, что задокументирован в
+    # add_ai_paused_tag) - если бы мы, как раньше, всегда слали {"value": contact.get("tags") or []},
+    # PUT стирал бы реальные теги контакта на пустой список каждый раз, когда GET вернёт
+    # устаревший/пустой снимок. Подтверждено на практике: у контакта с тегами "Предзапись
+    # Щитовидка с 01.05.26" и "Предзапись ЛАП с 12.07.26" оба тега были снесены именно так.
+    # Поле - Optional<T>, а значит его отсутствие в payload означает "не менять", а не
+    # "очистить" - поэтому просто не передаём tags/groups здесь.
+    updated_contact.pop("tags", None)
+    updated_contact.pop("groups", None)
 
     url = f"{PRODAMUS_BASE_URL}/crm/lead"
     headers = {
