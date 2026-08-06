@@ -23,9 +23,9 @@ QWEN_API_URL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/comp
 # время). Когда квота текущей первой модели в списке закончится - проверить оставшийся
 # лимит в Model Studio Console → Free Quota и добавить/поднять повыше свежий снапшот.
 QWEN_MODEL_CANDIDATES = [
-    "qwen-plus-2025-07-28",
-    "qwen-plus-2025-07-14",
-    "qwen-plus-2025-04-28",
+    "qwen3.5-plus-2026-02-15",
+    "qwen-max",
+    "qwen3-max",
 ]
 
 # Троттлинг Telegram-алерта о сбое Qwen (см. _alert_qwen_failure) - не чаще раза в
