@@ -1727,8 +1727,26 @@ def call_qwen_api(message_text, student_id, history=None, global_dates_text="", 
             if not FALLBACK_API_KEY:
                 raise
             print(f"WARNING: Qwen failed ({qwen_error}) - trying fallback provider (Groq)")
+            # Резервный провайдер (Groq) - урезанный payload, а не тот же самый, что для
+            # Qwen: подтверждено на практике 2026-08-07 - полный payload (история диалога +
+            # каталог/доступ/заказы студента реминдерами) поймал 413 Payload Too Large на
+            # бесплатном тарифе Groq (лимит там по токенам в минуту, не по размеру
+            # контекстного окна модели - оно у gpt-oss-120b/llama-3.3-70b 131k, но
+            # свободный тариф режет запрос гораздо раньше). Для резерва оставляем только
+            # системный промпт (вся база знаний школы + правила формата/анти-выдумывания
+            # уже там) и сырое сообщение студента - без истории диалога и без
+            # каталога/доступа/заказов реминдерами. Резерв работает только пока Qwen
+            # недоступен - деградация (бот не помнит историю и не знает актуальный
+            # каталог/доступ в этом одном ответе) приемлема ради того, чтобы вообще
+            # ответить, а не молчать. Инструкции "не выдумывай" в system_prompt не дают
+            # модели нафантазировать вместо честного "не могу сейчас проверить".
+            fallback_payload = dict(payload)
+            fallback_payload["messages"] = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": message_text},
+            ]
             raw_text, model_name = _call_llm_candidates(
-                FALLBACK_API_URL, FALLBACK_API_KEY, FALLBACK_MODEL_CANDIDATES, payload
+                FALLBACK_API_URL, FALLBACK_API_KEY, FALLBACK_MODEL_CANDIDATES, fallback_payload
             )
             print(f"DEBUG: Fallback raw answer (model={model_name}): {raw_text}")
             _alert_fallback_used(str(qwen_error), model_name)
