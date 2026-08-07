@@ -11,28 +11,28 @@ from html import unescape
 app = Flask(__name__)
 
 PRODAMUS_API_KEY = os.getenv("PRODAMUS_API_KEY")
-QWEN_API_KEY = os.getenv("QWEN_API_KEY")
+# Groq - основной провайдер (с 2026-08-07, замена Qwen/DashScope): бессрочный
+# бесплатный тариф без карты, квота суточная и обновляется каждый день (а не разовый
+# грант на модель, как был у Qwen - тот несколько раз намертво исчерпывался).
+# Читаем из GROQ_API_KEY, а если не задан - из FALLBACK_API_KEY (под этим именем ключ
+# уже мог быть добавлен в Vercel ранее, когда Groq был резервным провайдером).
+GROQ_API_KEY = os.getenv("GROQ_API_KEY") or os.getenv("FALLBACK_API_KEY")
 PRODAMUS_BASE_URL = "https://api.xl.ru/api/v1"
-QWEN_API_URL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions"
+GROQ_API_URL = os.getenv("GROQ_API_URL", "https://api.groq.com/openai/v1/chat/completions")
 
-# У каждого конкретного model code в DashScope Model Studio - своя ОТДЕЛЬНАЯ бесплатная
-# квота токенов (подтверждено на практике 2026-08-03: у алиаса "qwen-plus" квота
-# закончилась - 403 Forbidden/AllocationQuota.FreeTierOnly - а у датированных снапшотов
-# той же модели квота была нетронута). Пробуем модели по очереди, переходя к следующей
-# ТОЛЬКО при 403 (не при таймауте/сетевой ошибке - это не помогло бы и заняло бы лишнее
-# время). Когда квота текущей первой модели в списке закончится - проверить оставшийся
-# лимит в Model Studio Console → Free Quota и добавить/поднять повыше свежий снапшот.
-QWEN_MODEL_CANDIDATES = [
-    "qwen3.7-plus-2026-05-26",
-    "qwen-plus-2025-07-28",
-    "qwen-plus-2025-07-14",
-    "qwen-plus-2025-04-28",
+# Пробуем модели по очереди, переходя к следующей при ЛЮБОЙ ошибке (лимит, таймаут,
+# сбой сети) - не только при 403/429, как было у Qwen. На практике таймаут одной
+# модели не означает, что вторая модель тоже не ответит, а любой отказ без резерва
+# сразу замораживал диалог студента (тег ai_paused) до ручного вмешательства.
+GROQ_MODEL_CANDIDATES = [
+    "llama-3.3-70b-versatile",
+    "openai/gpt-oss-120b",
 ]
 
-# Троттлинг Telegram-алерта о сбое Qwen (см. _alert_qwen_failure) - не чаще раза в
+# Троттлинг Telegram-алерта о сбое LLM (см. _alert_llm_failure) - не чаще раза в
 # столько секунд, чтобы вспышка сбоев на разных сообщениях не заспамила уведомлениями.
-QWEN_FAILURE_ALERT_COOLDOWN_SECONDS = int(os.getenv("QWEN_FAILURE_ALERT_COOLDOWN_SECONDS", "900"))
-_last_qwen_failure_alert = {"time": 0.0}
+LLM_FAILURE_ALERT_COOLDOWN_SECONDS = int(os.getenv("LLM_FAILURE_ALERT_COOLDOWN_SECONDS", "900"))
+_last_llm_failure_alert = {"time": 0.0}
 
 # Telegram-уведомления, когда нужен человек.
 # TELEGRAM_CHAT_IDS - список ID через запятую, например: "111111111,222222222"
@@ -483,7 +483,7 @@ SCHOOL_INFO_OUTRO_CORE = """
 # Формат: (ключевые слова для поиска в сообщении студента, полный текст пары
 # вопрос-ответ). Подключается в system_prompt только совпавшими парами - см.
 # _select_faq_text() ниже - вместо того, чтобы слать все пары на каждое сообщение
-# независимо от темы (экономия токенов на запрос к Qwen).
+# независимо от темы (экономия токенов на запрос к LLM).
 SCHOOL_INFO_FAQ = [
     (["нмо", "баллы"],
      "В: Можно ли оплатить баллы НМО за прохождение курса?\n"
@@ -1170,33 +1170,31 @@ def build_student_orders_text(student_id):
     return "\n".join(lines), valid_links
 
 
-def _alert_qwen_failure(error_text):
+def _alert_llm_failure(error_text):
     """
-    Уведомляет владельца в Telegram при полном сбое вызова Qwen (все модели из
-    QWEN_MODEL_CANDIDATES не ответили). Подтверждено на практике 2026-08-03: раньше
-    такой сбой (например, исчерпание бесплатной квоты) оставался незамеченным -
-    бот молча отвечал всем студентам "не могу ответить", пока кто-то вручную не
-    проверил логи. Троттлинг через cooldown, а не подсчёт "N подряд ошибок" -
-    в serverless-окружении процесс не переживает между вызовами надёжно, чтобы
-    что-то подряд считать, а cooldown на практике даёт тот же результат: один
-    алерт на вспышку сбоев, а не спам на каждое сообщение студента.
+    Уведомляет владельца в Telegram при полном сбое вызова LLM (все модели из
+    GROQ_MODEL_CANDIDATES не ответили). Подтверждено на практике 2026-08-03: раньше
+    такой сбой оставался незамеченным - бот молча отвечал всем студентам "не могу
+    ответить", пока кто-то вручную не проверил логи. Троттлинг через cooldown, а не
+    подсчёт "N подряд ошибок" - в serverless-окружении процесс не переживает между
+    вызовами надёжно, чтобы что-то подряд считать, а cooldown на практике даёт тот
+    же результат: один алерт на вспышку сбоев, а не спам на каждое сообщение студента.
     """
     now = time.time()
-    if now - _last_qwen_failure_alert["time"] < QWEN_FAILURE_ALERT_COOLDOWN_SECONDS:
+    if now - _last_llm_failure_alert["time"] < LLM_FAILURE_ALERT_COOLDOWN_SECONDS:
         return
-    _last_qwen_failure_alert["time"] = now
+    _last_llm_failure_alert["time"] = now
     send_telegram_notification(
-        "🔴 Qwen API не отвечает ни на одной из моделей\n\n"
+        "🔴 Groq API не отвечает ни на одной из моделей\n\n"
         f"Ошибка: {error_text}\n\n"
-        "Возможные причины: закончилась бесплатная квота у ВСЕХ моделей из списка "
-        "(проверить Model Studio Console → Free Quota и добавить свежий снапшот в "
-        "QWEN_MODEL_CANDIDATES), невалидный ключ, сбой сервиса DashScope. Пока это "
-        "не починится, бот всем студентам отвечает \"не могу ответить\" и зовёт "
-        "человека."
+        "Возможные причины: превышен дневной лимит запросов (30/мин, 14400/день на "
+        "free tier), невалидный ключ (GROQ_API_KEY/FALLBACK_API_KEY), сбой сервиса "
+        "Groq. Пока это не починится, бот всем студентам отвечает \"не могу ответить\" "
+        "и зовёт человека."
     )
 
 
-def call_qwen_api(message_text, student_id, history=None, global_dates_text="", current_price_text="",
+def call_llm_api(message_text, student_id, history=None, global_dates_text="", current_price_text="",
                    student_email=None):
     """
     Возвращает (reply_text, needs_human).
@@ -1213,11 +1211,11 @@ def call_qwen_api(message_text, student_id, history=None, global_dates_text="", 
     extract_student_email(). "" значит подтверждённое отсутствие email в CRM,
     None значит, что определить не удалось (не то же самое, что отсутствие).
 
-    Просим Qwen отвечать строго в формате JSON, чтобы явно понимать,
+    Просим модель отвечать строго в формате JSON, чтобы явно понимать,
     нужно ли звать человека, без хрупкого поиска ключевых слов в тексте.
     """
 
-    if not QWEN_API_KEY:
+    if not GROQ_API_KEY:
         return "Ошибка: не настроен ключ нейросети.", False
 
     student_access_text = build_student_access_text(student_id)
@@ -1440,7 +1438,7 @@ def call_qwen_api(message_text, student_id, history=None, global_dates_text="", 
             + (history or [])
             + [{"role": "user", "content": user_message_with_context}]
         ),
-        # Без этого Qwen иногда игнорирует инструкцию про формат ответа и отвечает
+        # Без этого модель иногда игнорирует инструкцию про формат ответа и отвечает
         # обычным текстом вместо JSON - тогда парсинг падает и needs_human=True
         # выставляется "на всякий случай" даже если по сути отвечать было не нужно.
         # response_format форсирует валидный JSON на стороне самой модели.
@@ -1448,33 +1446,30 @@ def call_qwen_api(message_text, student_id, history=None, global_dates_text="", 
     }
 
     try:
-        response = None
+        raw_text = None
         last_error = None
-        headers = {"Authorization": f"Bearer {QWEN_API_KEY}", "Content-Type": "application/json"}
+        headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
 
-        for model_name in QWEN_MODEL_CANDIDATES:
+        for model_name in GROQ_MODEL_CANDIDATES:
             payload["model"] = model_name
-            resp = requests.post(QWEN_API_URL, headers=headers, json=payload, timeout=30)
-            print(f"DEBUG: Qwen status={resp.status_code} (model={model_name})")
-
-            if resp.status_code == 403:
-                # У этой конкретной модели закончилась её отдельная бесплатная квота -
-                # переходим к следующему снапшоту из списка (не при других ошибках,
-                # чтобы не тратить время на заведомо неудачные повторы при сетевом
-                # сбое/таймауте - там следующая модель, скорее всего, тоже не поможет).
-                last_error = f"403 Forbidden for model={model_name} (probably quota exhausted)"
-                print(f"WARNING: {last_error} - trying next model candidate")
+            try:
+                resp = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=30)
+                print(f"DEBUG: Groq status={resp.status_code} (model={model_name})")
+                resp.raise_for_status()
+                raw_text = resp.json()["choices"][0]["message"]["content"]
+                break
+            except Exception as model_error:
+                # Любая ошибка (лимит, таймаут, сбой сети) - пробуем следующую модель
+                # из списка, а не сразу сдаёмся: единичный сбой одной модели не должен
+                # сразу замораживать диалог студента (тег ai_paused, см. add_ai_paused_tag).
+                last_error = f"{model_name}: {model_error}"
+                print(f"WARNING: Groq call failed for model={model_name} ({model_error}) - trying next candidate")
                 continue
 
-            resp.raise_for_status()
-            response = resp
-            break
+        if raw_text is None:
+            raise RuntimeError(last_error or "All GROQ_MODEL_CANDIDATES failed")
 
-        if response is None:
-            raise RuntimeError(last_error or "All QWEN_MODEL_CANDIDATES returned 403")
-
-        raw_text = response.json()["choices"][0]["message"]["content"]
-        print(f"DEBUG: Qwen raw answer (model={model_name}): {raw_text}")
+        print(f"DEBUG: Groq raw answer (model={model_name}): {raw_text}")
 
         # На случай, если модель всё же обернёт JSON в ```json ... ```
         cleaned = raw_text.strip()
@@ -1602,11 +1597,11 @@ def call_qwen_api(message_text, student_id, history=None, global_dates_text="", 
     except json.JSONDecodeError as e:
         # Если модель вернула не-JSON - используем сырой текст как ответ,
         # и на всякий случай считаем, что человек может понадобиться
-        print(f"ERROR: Qwen did not return valid JSON: {e}")
-        return raw_text if 'raw_text' in dir() else "Извините, сейчас я не могу ответить. Попробуйте позже.", True
+        print(f"ERROR: LLM did not return valid JSON: {e}")
+        return raw_text or "Извините, сейчас я не могу ответить. Попробуйте позже.", True
     except Exception as e:
-        print(f"ERROR: Qwen failed: {e}")
-        _alert_qwen_failure(str(e))
+        print(f"ERROR: LLM failed: {e}")
+        _alert_llm_failure(str(e))
         return "Извините, сейчас я не могу ответить. Попробуйте позже.", True
 
 
@@ -1717,7 +1712,7 @@ def extract_student_email(items, student_id):
 
 def build_conversation_history(items, student_id, current_message_text, max_messages):
     """
-    Превращает последние сообщения канала в список [{"role", "content"}] для Qwen -
+    Превращает последние сообщения канала в список [{"role", "content"}] для LLM -
     минимальная память бота о разговоре (последние max_messages сообщений).
 
     items идут от новых к старым - разворачиваем в хронологический порядок.
@@ -1901,19 +1896,19 @@ def webhook():
     # обращения к нейросети вообще - подтверждено владельцем школы: у этого сценария
     # свой правильный UI (как у /start), а не произвольная формулировка модели.
     # Исключение - если студент ЭТИМ ЖЕ сообщением уже прислал email: тогда пропускаем
-    # сценарий и даём обычному потоку (Qwen + requestedEmailChange) обработать его.
+    # сценарий и даём обычному потоку (LLM + requestedEmailChange) обработать его.
     if student_email == "" and not EMAIL_RE.match((message_text or "").strip()):
-        print("DEBUG: Email confirmed missing - running link/request-email scenario, skipping Qwen")
+        print("DEBUG: Email confirmed missing - running link/request-email scenario, skipping LLM")
         scenario_ok = run_scenario(LINK_ACCOUNT_BY_EMAIL_SCENARIO_ID, student_id)
         print(f"DEBUG: Link/request-email scenario (no AI call) success={scenario_ok}")
         if scenario_ok:
             return jsonify({"status": "ok", "message": "Email missing - request-email scenario triggered"}), 200
-        print("WARNING: Link/request-email scenario failed to run - falling back to normal Qwen flow")
+        print("WARNING: Link/request-email scenario failed to run - falling back to normal LLM flow")
 
-    # 1. Получаем ответ от Qwen (с учётом общей базы знаний школы, доступа этого студента
+    # 1. Получаем ответ от LLM (с учётом общей базы знаний школы, доступа этого студента
     # и истории последних сообщений диалога)
-    print(f"DEBUG: Calling Qwen with: '{message_text[:80]}...'")
-    ai_response, needs_human = call_qwen_api(
+    print(f"DEBUG: Calling LLM with: '{message_text[:80]}...'")
+    ai_response, needs_human = call_llm_api(
         message_text, student_id, conversation_history, global_dates_text, current_price_text,
         student_email
     )
