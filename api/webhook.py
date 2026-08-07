@@ -5,6 +5,7 @@ import json
 import re
 import time
 import hmac
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta, datetime, timezone
 from html import unescape
 
@@ -1218,8 +1219,14 @@ def call_llm_api(message_text, student_id, history=None, global_dates_text="", c
     if not GROQ_API_KEY:
         return "Ошибка: не настроен ключ нейросети.", False
 
-    student_access_text = build_student_access_text(student_id)
-    student_orders_text, valid_payment_links = build_student_orders_text(student_id)
+    # Доступы и заказы студента - независимые запросы к разным эндпоинтам Prodamus,
+    # ни один не нужен для другого - выполняем параллельно (в потоках, не последовательно),
+    # чтобы не складывать их время ожидания. Экономит 0.5-1 сек на каждое сообщение студента.
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        access_future = executor.submit(build_student_access_text, student_id)
+        orders_future = executor.submit(build_student_orders_text, student_id)
+        student_access_text = access_future.result()
+        student_orders_text, valid_payment_links = orders_future.result()
 
     # Подключаем только те пары FAQ, чьи ключевые слова совпали с сообщением студента -
     # экономит токены на большинстве сообщений, где ни один из этих узких вопросов не
