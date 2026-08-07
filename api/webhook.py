@@ -23,6 +23,7 @@ QWEN_API_URL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/comp
 # время). Когда квота текущей первой модели в списке закончится - проверить оставшийся
 # лимит в Model Studio Console → Free Quota и добавить/поднять повыше свежий снапшот.
 QWEN_MODEL_CANDIDATES = [
+    "qwen3.8-max",  # добавлена 2026-08-07 - свежая модель, отдельная квота от остальных
     "qwen3.5-plus-2026-02-15",
     "qwen-max",
     "qwen3-max",
@@ -1071,6 +1072,14 @@ ASK_HUMAN_SCENARIO_ID = "Y6Ks22RSKU22GMJY8keX5w"
 # ненадёжного GET/webhook-macro (см. CHANGES.md).
 ADD_AI_PAUSED_TAG_SCENARIO_ID = "GqO0oD-t90Wxkv2_MWVm3Q"
 
+# Сценарий "Прислать доступы" - запускается через /access (см. student_access_webhook
+# ниже), получает готовый текст доступа студента через кастомное поле data.access и сам
+# отправляет сообщение в чат. Тот же паттерн, что и у остальных действий бота в этом
+# файле (пауза, кнопка "Позвать специалиста", оформление заказа) - отправку делает
+# сценарий Prodamus через run_scenario, а не наш код напрямую через
+# send_prodamus_message.
+SEND_STUDENT_ACCESS_SCENARIO_ID = "kZtYj40ld0OwSxYCFUhcSQ"
+
 
 def pause_ai_for_contact(student_id):
     """Ставит тег AI_PAUSED_TAG через сценарий Prodamus - см. комментарий у
@@ -1078,11 +1087,15 @@ def pause_ai_for_contact(student_id):
     return run_scenario(ADD_AI_PAUSED_TAG_SCENARIO_ID, student_id)
 
 
-def run_scenario(scenario_id, contact_id, contact_data=None):
+def run_scenario(scenario_id, contact_id, contact_data=None, data=None):
     """POST /api/v1/scenario/run - запускает сценарий Prodamus для существующего контакта.
 
     contact_data - опциональный словарь для поля "contactData" запроса (например,
     email, по которому сценарий должен найти/связать аккаунт).
+    data - опциональный словарь произвольных данных для поля "data" запроса (например,
+    готовый текст, который сам сценарий подставит в сообщение через свой макрос) - это
+    НЕ поля контакта, а именно произвольные пользовательские данные, отдельные от
+    contactData.
     """
     url = f"{PRODAMUS_BASE_URL}/scenario/run"
     headers = {
@@ -1092,6 +1105,8 @@ def run_scenario(scenario_id, contact_id, contact_data=None):
     payload = {"scenarioId": scenario_id, "contactId": contact_id}
     if contact_data:
         payload["contactData"] = contact_data
+    if data:
+        payload["data"] = data
 
     try:
         response = requests.post(url, headers=headers, json=payload, timeout=15)
@@ -1099,12 +1114,24 @@ def run_scenario(scenario_id, contact_id, contact_data=None):
         print(f"DEBUG: Run scenario body: {response.text[:500]}")
         if response.status_code != 200:
             return False
-        data = response.json()
-        return bool(data.get("success"))
+        resp_data = response.json()
+        return bool(resp_data.get("success"))
     except Exception as e:
         print(f"ERROR: Failed to run scenario: {e}")
         return False
 
+
+# Короткий TTL-кэш персональных данных студента (доступ, заказы) - на практике студент
+# часто пишет несколько сообщений подряд в одном диалоге, и без кэша каждое из них
+# заново дёргает Prodamus за одними и теми же (за секунды не меняющимися) данными.
+# TTL специально короткий (не как у каталога, 900с) - эти данные считаются "самыми
+# свежими" и должны побеждать историю переписки (см. правило в call_qwen_api), поэтому
+# кэш не должен успевать замылить реальное изменение доступа/оплаты, произошедшее прямо
+# во время диалога.
+STUDENT_DATA_CACHE_TTL_SECONDS = int(os.getenv("STUDENT_DATA_CACHE_TTL_SECONDS", "25"))
+
+_student_access_cache = {}  # student_id -> {"text": str, "fetched_at": float}
+_student_orders_cache = {}  # student_id -> {"text": str, "links": set, "fetched_at": float}
 
 LICENSE_STATE_LABELS = {
     "active": "включён",
@@ -1159,37 +1186,46 @@ def fetch_student_course_accesses(student_id):
 def build_student_access_text(student_id):
     """
     Формирует текст о РЕАЛЬНОМ доступе ЭТОГО студента к курсам/продуктам на основе его
-    лицензий (StudentLicense), а не статуса оплаты заказов. Персональный блок, поэтому
-    не кэшируется (в отличие от общего каталога) - запрашивается заново на каждое сообщение.
+    лицензий (StudentLicense), а не статуса оплаты заказов. Персональный блок, кэшируется
+    на STUDENT_DATA_CACHE_TTL_SECONDS (см. комментарий у кэша выше) - в пределах одного
+    диалога подряд идущие сообщения не дёргают Prodamus заново.
     """
+    now = time.time()
+    cached = _student_access_cache.get(student_id)
+    if cached and (now - cached["fetched_at"] < STUDENT_DATA_CACHE_TTL_SECONDS):
+        return cached["text"]
+
     accesses = fetch_student_course_accesses(student_id)
     if not accesses:
-        return "У этого студента нет ни одной лицензии доступа в Prodamus (или не удалось их получить)."
+        text = "У этого студента нет ни одной лицензии доступа в Prodamus (или не удалось их получить)."
+    else:
+        lines = []
+        for lic in accesses:
+            course = lic.get("course") or {}
+            product = lic.get("product") or {}
+            course_plan = lic.get("coursePlan") or {}
 
-    lines = []
-    for lic in accesses:
-        course = lic.get("course") or {}
-        product = lic.get("product") or {}
-        course_plan = lic.get("coursePlan") or {}
+            if course.get("name"):
+                name = f"курс «{course['name']}»"
+                if course_plan.get("name"):
+                    name += f", тариф «{course_plan['name']}»"
+            elif product.get("name"):
+                name = f"продукт «{product['name']}»"
+            else:
+                name = "неизвестный курс/продукт"
 
-        if course.get("name"):
-            name = f"курс «{course['name']}»"
-            if course_plan.get("name"):
-                name += f", тариф «{course_plan['name']}»"
-        elif product.get("name"):
-            name = f"продукт «{product['name']}»"
-        else:
-            name = "неизвестный курс/продукт"
+            state_label = LICENSE_STATE_LABELS.get(lic.get("state"), lic.get("state") or "неизвестно")
+            relevance_label = LICENSE_RELEVANCE_LABELS.get(lic.get("relevance"), lic.get("relevance") or "")
 
-        state_label = LICENSE_STATE_LABELS.get(lic.get("state"), lic.get("state") or "неизвестно")
-        relevance_label = LICENSE_RELEVANCE_LABELS.get(lic.get("relevance"), lic.get("relevance") or "")
+            end_date = lic.get("endDate")
+            end_text = f", доступ до {end_date[:10]}" if end_date else ", без даты окончания (бессрочно)"
 
-        end_date = lic.get("endDate")
-        end_text = f", доступ до {end_date[:10]}" if end_date else ", без даты окончания (бессрочно)"
+            lines.append(f"- {name} — доступ {state_label}, {relevance_label}{end_text}")
 
-        lines.append(f"- {name} — доступ {state_label}, {relevance_label}{end_text}")
+        text = "\n".join(lines)
 
-    return "\n".join(lines)
+    _student_access_cache[student_id] = {"text": text, "fetched_at": now}
+    return text
 
 
 ORDER_STATUS_LABELS = {
@@ -1351,59 +1387,69 @@ def build_student_orders_text(student_id):
     его (самый свежий из таких), остальные черновики без оплаты молча скрываем, чтобы
     не путать студента списком из пяти одинаковых заказов. Если оплаты не было вообще -
     показываем самый свежий черновик, чтобы можно было ответить "заказ создан, но не
-    оплачен". Персональный блок, не кэшируется - запрашивается заново на каждое сообщение.
+    оплачен". Персональный блок, кэшируется на STUDENT_DATA_CACHE_TTL_SECONDS (см.
+    комментарий у кэша выше) - в пределах одного диалога подряд идущие сообщения не
+    дёргают Prodamus заново.
 
     Возвращает (текст, множество РЕАЛЬНО сгенерированных ссылок на оплату) - второе
     нужно, чтобы потом проверить, что модель не подставила в ответ ссылку, которую
     мы сами не создавали (см. _sanitize_reply_payment_links).
     """
+    now = time.time()
+    cached = _student_orders_cache.get(student_id)
+    if cached and (now - cached["fetched_at"] < STUDENT_DATA_CACHE_TTL_SECONDS):
+        return cached["text"], cached["links"]
+
     orders = fetch_student_orders(student_id)
     orders = [o for o in orders if not o.get("softDeleted")]
     if not orders:
-        return "У этого студента нет заказов в Prodamus (или не удалось их получить).", set()
+        text, valid_links = "У этого студента нет заказов в Prodamus (или не удалось их получить).", set()
+    else:
+        groups = {}
+        for order in orders:
+            key = _order_product_key(order)
+            groups.setdefault(key, []).append(order)
 
-    groups = {}
-    for order in orders:
-        key = _order_product_key(order)
-        groups.setdefault(key, []).append(order)
+        def sort_key(o):
+            return o.get("createdDate") or ""
 
-    def sort_key(o):
-        return o.get("createdDate") or ""
-
-    lines = []
-    valid_links = set()
-    for key, group_orders in groups.items():
-        paid_attempts = [o for o in group_orders if o.get("status") in ORDER_HAS_PAYMENT_STATUSES]
-        if paid_attempts:
-            chosen = max(paid_attempts, key=sort_key)
-        else:
-            chosen = max(group_orders, key=sort_key)
-
-        status_label = ORDER_STATUS_LABELS.get(chosen.get("status"), chosen.get("status") or "неизвестен")
-        product_names = _order_product_names(chosen)
-        products_text = ", ".join(product_names) if product_names else "товар не определён"
-
-        currency = (chosen.get("currency") or "rub").lower()
-        symbol = CURRENCY_SYMBOLS.get(currency, currency.upper())
-        paid_amount = chosen.get("paidAmount") or 0
-        total_amount = chosen.get("totalAmount") or 0
-        amount_text = f"{paid_amount:,.0f} из {total_amount:,.0f} {symbol}".replace(",", " ")
-
-        skipped = len(group_orders) - 1
-        skipped_text = f" (плюс ещё {skipped} неоплаченных дублей этого же заказа, не учитываются)" if skipped > 0 else ""
-
-        link = _order_payment_link(chosen)
-        link_text = ""
-        if link:
-            valid_links.add(link)
-            if chosen.get("status") == "partiallyPaid":
-                link_text = f" | ссылка на оплату оставшейся части: {link}"
+        lines = []
+        valid_links = set()
+        for key, group_orders in groups.items():
+            paid_attempts = [o for o in group_orders if o.get("status") in ORDER_HAS_PAYMENT_STATUSES]
+            if paid_attempts:
+                chosen = max(paid_attempts, key=sort_key)
             else:
-                link_text = f" | ссылка на оплату: {link}"
+                chosen = max(group_orders, key=sort_key)
 
-        lines.append(f"- {products_text}: {status_label}, оплачено {amount_text}{skipped_text}{link_text}")
+            status_label = ORDER_STATUS_LABELS.get(chosen.get("status"), chosen.get("status") or "неизвестен")
+            product_names = _order_product_names(chosen)
+            products_text = ", ".join(product_names) if product_names else "товар не определён"
 
-    return "\n".join(lines), valid_links
+            currency = (chosen.get("currency") or "rub").lower()
+            symbol = CURRENCY_SYMBOLS.get(currency, currency.upper())
+            paid_amount = chosen.get("paidAmount") or 0
+            total_amount = chosen.get("totalAmount") or 0
+            amount_text = f"{paid_amount:,.0f} из {total_amount:,.0f} {symbol}".replace(",", " ")
+
+            skipped = len(group_orders) - 1
+            skipped_text = f" (плюс ещё {skipped} неоплаченных дублей этого же заказа, не учитываются)" if skipped > 0 else ""
+
+            link = _order_payment_link(chosen)
+            link_text = ""
+            if link:
+                valid_links.add(link)
+                if chosen.get("status") == "partiallyPaid":
+                    link_text = f" | ссылка на оплату оставшейся части: {link}"
+                else:
+                    link_text = f" | ссылка на оплату: {link}"
+
+            lines.append(f"- {products_text}: {status_label}, оплачено {amount_text}{skipped_text}{link_text}")
+
+        text = "\n".join(lines)
+
+    _student_orders_cache[student_id] = {"text": text, "links": valid_links, "fetched_at": now}
+    return text, valid_links
 
 
 def _alert_qwen_failure(error_text):
@@ -2181,6 +2227,35 @@ def send_prodamus_message(chat_channel_id, student_id, text, conversation_id=Non
         return False
 
 
+def _already_answered(recent_items, student_id, message_text):
+    """
+    Обнаруживает повторный вызов вебхука на ОДНО И ТО ЖЕ сообщение (см. CHANGES.md -
+    "Дублирование ответов из-за retry-цепочки", подтверждённый неисправленный баг).
+    В норме recent_items[0] (самый свежий) - это текущее сообщение студента, Prodamus
+    записывает его до вызова вебхука. Если вместо этого recent_items[0] - уже ответ
+    бота (user.isSystem=true), а recent_items[1] - то же самое сообщение от этого же
+    студента - значит бот уже ответил на него в предыдущем (дублирующем) вызове вебхука,
+    и повторно отвечать не нужно. Использует уже полученные recent_items - без
+    дополнительного запроса к API.
+
+    Не ловит случай, когда оба дублирующих вызова пришли одновременно (второй стартовал
+    до того, как первый успел отправить ответ) - тут защиты по-прежнему нет, но
+    последовательный retry (второй вызов уже после того, как первый отработал) закрывает.
+    """
+    if len(recent_items) < 2:
+        return False
+
+    newest_user = recent_items[0].get("user") or {}
+    if not newest_user.get("isSystem"):
+        return False
+
+    prev = recent_items[1]
+    prev_contact = (prev.get("user") or {}).get("contact") or {}
+    prev_text = (prev.get("text") or "").strip()
+
+    return prev_contact.get("id") == student_id and prev_text == (message_text or "").strip()
+
+
 @app.route('/', methods=['POST', 'GET'])
 def webhook():
     print("=" * 60)
@@ -2314,6 +2389,15 @@ def webhook():
     recent_items = fetch_recent_channel_messages(
         chat_channel_id, student_id, take=CONVERSATION_HISTORY_FETCH_COUNT
     )
+
+    if _already_answered(recent_items, student_id, message_text):
+        print(
+            "DEBUG: This exact message already has a bot reply right after it in the "
+            "channel - looks like a duplicate webhook call (retry), skipping to avoid "
+            "double-processing"
+        )
+        return jsonify({"status": "ignored", "message": "Duplicate webhook call - already answered"}), 200
+
     conversation_history = build_conversation_history(
         recent_items, student_id, message_text, CONVERSATION_HISTORY_MESSAGE_COUNT
     )
@@ -2381,6 +2465,57 @@ def webhook():
     else:
         print("ERROR: Failed to send")
         return jsonify({"status": "error", "message": "Failed to send to Prodamus"}), 500
+
+
+@app.route('/access', methods=['POST', 'GET'])
+def student_access_webhook():
+    """
+    Отдельный вебхук для отдельного сценария Prodamus ("Мои доступы" - кнопка/команда,
+    не обычное текстовое сообщение). В отличие от основного вебхука ('/') здесь Qwen
+    вообще не вызывается: доступ студента - это детерминированные данные из CRM
+    (build_student_access_text, уже с коротким TTL-кэшем), пересказывать их нейросетью
+    незачем. Само сообщение студенту отправляет не этот код напрямую, а отдельный
+    сценарий Prodamus (SEND_STUDENT_ACCESS_SCENARIO_ID) через run_scenario - готовый
+    текст доступа передаётся туда как data.access. Из-за этого здесь не нужны
+    chatChannelId/conversationId и не нужен fetch_recent_channel_messages вообще -
+    доставку сообщения делает сам сценарий Prodamus, а не наш код.
+    """
+    if WEBHOOK_SECRET:
+        provided_token = request.args.get("token", "")
+        if not hmac.compare_digest(provided_token, WEBHOOK_SECRET):
+            print("WARNING: /access request rejected - missing or invalid ?token=")
+            return jsonify({"status": "error", "message": "Unauthorized"}), 401
+
+    data = {}
+    if request.is_json and request.content_length and request.content_length > 0:
+        data = request.get_json(silent=True) or {}
+    if not data and request.form:
+        data = request.form.to_dict()
+    if not data:
+        data = request.args.to_dict()
+
+    print(f"DEBUG: /access received data: {data}")
+
+    student_id = (
+        data.get("studentId") or data.get("StudentId")
+        or data.get("contactId")
+    )
+
+    if not student_id:
+        return jsonify({"status": "error", "message": "Missing studentId"}), 400
+
+    access_text = build_student_access_text(student_id)
+
+    success = run_scenario(
+        SEND_STUDENT_ACCESS_SCENARIO_ID, student_id, data={"access": access_text}
+    )
+
+    if success:
+        print("SUCCESS: Access scenario triggered!")
+        return jsonify({"status": "success"}), 200
+    else:
+        print("ERROR: Failed to trigger access scenario")
+        return jsonify({"status": "error", "message": "Failed to run scenario"}), 500
 
 
 if __name__ == '__main__':
